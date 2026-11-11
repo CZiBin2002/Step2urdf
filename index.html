@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="本地 CAD2URDF 工作台，编辑机器人 Link 与关节，导出模型和强化学习工程。">
+  <meta name="theme-color" content="#111820">
+  <title>Step2URDF · CAD 工作台</title>
+</head>
+<body>
+  <header class="header">
+    <div class="brand"><span class="brand-icon"><i data-lucide="box"></i></span><div><strong>Step2URDF</strong><small>CAD WORKBENCH</small></div></div>
+    <span class="header-divider"></span>
+    <div class="active-project"><i data-lucide="folder"></i><span id="projectName">正在载入</span></div>
+    <div class="top-actions">
+      <button id="undo" class="icon-button" title="撤销 (Ctrl+Z)" aria-label="撤销"><i data-lucide="undo-2"></i></button>
+      <button id="redo" class="icon-button" title="重做 (Ctrl+Y)" aria-label="重做"><i data-lucide="redo-2"></i></button>
+      <button id="saveProject" class="button secondary"><i data-lucide="save"></i><span>保存工程</span></button>
+      <button id="openExport" class="button primary"><i data-lucide="download"></i><span>导出</span></button>
+    </div>
+  </header>
+  <nav class="workflow" aria-label="工作流程">
+    <button data-step="import"><span class="step-no">01</span><span>导入模型</span></button><span class="step-rule"></span>
+    <button class="active" data-step="configure"><span class="step-no">02</span><span>配置 Link / 关节</span></button><span class="step-rule"></span>
+    <button data-step="export"><span class="step-no">03</span><span>测试与导出</span></button>
+  </nav>
+  <main class="workspace">
+    <aside class="explorer" aria-label="装配结构">
+      <div class="panel-title"><i data-lucide="layers-3"></i><h2>装配结构</h2><button id="importButton" class="icon-button" title="导入模型" aria-label="导入模型"><i data-lucide="folder-open"></i></button></div>
+      <label class="search"><i data-lucide="search"></i><input id="search" type="search" placeholder="搜索零件、Link 或关节"></label>
+      <div id="tree-tabs" class="tabs"><button data-tree="links" class="active">Link</button><button data-tree="joints">关节</button><button data-tree="parts">零件</button><button data-tree="loops">闭链</button></div>
+      <div id="tree" class="tree"></div>
+      <div id="tree-actions" class="panel-bottom"></div>
+    </aside>
+    <section id="viewport" class="viewport" aria-label="机器人三维预览">
+      <div id="canvasHost" class="canvas-host"></div>
+      <div class="viewport-title"><span class="status-dot"></span><span>3D 视图</span><span class="viewport-label">透视</span></div>
+      <div class="view-tools">
+        <button id="fit" class="icon-button" title="适配视图" aria-label="适配视图"><i data-lucide="maximize"></i></button>
+        <button id="topView" class="icon-button" title="顶视图" aria-label="顶视图"><i data-lucide="arrow-down-to-line"></i></button>
+        <button id="showCollisions" class="icon-button" aria-pressed="false" title="显示碰撞体" aria-label="显示碰撞体"><i data-lucide="scan-line"></i></button>
+        <button id="resetPose" class="icon-button" title="重置关节姿态" aria-label="重置关节姿态"><i data-lucide="rotate-ccw"></i></button>
+      </div>
+      <div class="view-axes" aria-label="Z 轴朝上"><span class="z">Z</span><span class="x">X</span><span class="y">Y</span></div>
+      <div class="view-hint"><i data-lucide="mouse"></i>拖动旋转 <b>·</b> 滚轮缩放 <b>·</b> 右键平移</div>
+      <div id="viewMessage" class="view-message">正在载入示例模型…</div>
+    </section>
+    <aside class="inspector" aria-label="属性与建议">
+      <div class="panel-title"><i data-lucide="sliders-horizontal"></i><h2>检查器</h2><button id="help" class="icon-button" aria-label="帮助" title="帮助"><i data-lucide="circle-help"></i></button></div>
+      <div id="inspector-tabs" class="tabs"><button data-inspect="properties" class="active">属性</button><button data-inspect="pose">试转</button><button data-inspect="ai"><i data-lucide="sparkles"></i> AI 建议</button></div>
+      <div id="inspector-body" class="inspector-body"></div>
+    </aside>
+  </main>
+  <footer class="footer"><span><span class="status-dot"></span> 本地工作区</span><span class="footer-meta" id="counts">—</span><span class="footer-right">Z-UP <b>·</b> 米 / 弧度 <b>·</b> <span id="sourceLabel">等待模型</span></span></footer>
+  <dialog id="dialog" aria-labelledby="dialogTitle"></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <input id="modelInput" type="file" multiple accept=".step,.stp,.urdf,.xml,.mjcf,.usd,.usda,.usdc,.zip,.json" hidden>
+  <input id="folderInput" type="file" webkitdirectory multiple hidden>
+  <script type="module" src="/frontend/main.js"></script>
+</body>
+</html>

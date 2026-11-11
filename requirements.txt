@@ -1,0 +1,9 @@
+cadquery-ocp-novtk>=7.9,<8
+fastapi>=0.115,<1
+mujoco>=3.4,<4
+numpy>=2,<3
+pycollada>=0.9,<1
+python-multipart>=0.0.18,<1
+trimesh>=4.6,<5
+usd-core>=25,<27
+uvicorn>=0.34,<1
