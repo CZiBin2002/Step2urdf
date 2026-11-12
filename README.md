@@ -9,14 +9,12 @@ Step2URDF 是本地运行的机器人 CAD 工作台。导入 STEP 装配后，�
 ```powershell
 git clone https://github.com/CZiBin2002/Step2urdf.git
 cd Step2urdf
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-npm.cmd ci
-npm.cmd run build
-.\.venv\Scripts\python.exe -m uvicorn workbench.server:app --host 127.0.0.1 --port 8765
+.\start.cmd
 ```
 
-保持终端运行，在浏览器打开 [本地工作台](http://127.0.0.1:8765/)。首次打开会载入 Atlas R6 示例。按 Ctrl+C 可停止服务。再次启动时，在仓库目录执行上面最后一条命令即可。
+也可以在资源管理器中双击 `start.cmd`。脚本会准备 `.venv`、安装依赖、构建前端并启动服务。前端依赖清单未变时，脚本会复用已安装的包。如果现有 `.venv` 无法运行，脚本会将它备份为 `venv.bak` 后重建。
+
+服务启动后，在浏览器打开 [本地工作台](http://127.0.0.1:8765/)。首次打开会载入 Atlas R6 示例。按 Ctrl+C 可停止服务。修改前端后，重启 `start.cmd` 即可重新构建。
 
 ## 使用教程
 
