@@ -33,6 +33,7 @@ class ExportRequest(Model):
     project: Project
     formats: list[Literal["urdf", "mjcf", "usd"]]
     merge: bool = False
+    simplify_urdf: bool = False
     training: Literal["isaac", "mjlab"] | None = None
 
 
@@ -190,7 +191,8 @@ def save_project(job: str, project: Project):
 
 @app.post("/api/projects/{job}/validate")
 def validate_project(job: str, request: ExportRequest):
-    errors, warnings = inspect_export(request.project, read_job(job)["parts"], request.formats, request.merge)
+    errors, warnings = inspect_export(request.project, read_job(job)["parts"], request.formats, request.merge,
+                                      simplify_urdf=request.simplify_urdf)
     return {"errors": errors, "warnings": warnings}
 
 
@@ -231,11 +233,14 @@ def export(job: str, request: ExportRequest):
     try:
         if not request.formats and not request.training:
             raise ValueError("请选择导出格式。")
-        result = export_zip(request.project, read_job(job)["parts"], request.formats, request.merge, request.training)
+        result = export_zip(request.project, read_job(job)["parts"], request.formats, request.merge, request.training,
+                            simplify_urdf=request.simplify_urdf)
     except (ValueError, RuntimeError) as error:
         raise HTTPException(422, str(error)) from error
     name = identifier(request.project.name)
     suffix = f"-{request.training}-training" if request.training else ""
+    if request.simplify_urdf and "urdf" in request.formats:
+        suffix += "-simplified"
     return Response(result, media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{name}{suffix}.zip"'})
 

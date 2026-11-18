@@ -51,7 +51,7 @@ let massProperties = {};
 let pendingMass = 0;
 let toastTimeout;
 let saveRequest = Promise.resolve();
-let exportOptions = { formats: ['urdf'], merge: false, training: 'isaac' };
+let exportOptions = { formats: ['urdf'], merge: false, simplify_urdf: false, training: 'isaac' };
 
 const dialog = $('#dialog');
 let viewer;
@@ -936,6 +936,10 @@ function openExport() {
       '><strong>' + name + '</strong><span>' + description + '</span></label>').join('') + '</div>' +
     '<label class="check-row"><input id="mergeMeshes" type="checkbox"' + (exportOptions.merge ? ' checked' : '') +
     '>每个 Link 合并导出的 STL 网格</label>' +
+    '<label class="check-row"><input id="simplifyUrdf" type="checkbox" aria-describedby="simplifyUrdfHint"' +
+    (exportOptions.simplify_urdf ? ' checked' : '') + (exportOptions.formats.includes('urdf') ? '' : ' disabled') +
+    '>精简 URDF 网格</label>' +
+    '<p class="subtle" id="simplifyUrdfHint">减少 URDF 视觉和碰撞网格的三角面，适合 Jetson Nano 等设备。细小几何细节可能减少。</p>' +
     '<div class="inline-actions"><button class="button secondary" id="verifyModel">' + icon('check') + '检查模型</button>' +
     '<button class="button secondary" id="testPose">' + icon('scan-line') + '在 3D 中试转</button>' +
     '<button class="button primary push" id="downloadModel">' + icon('download') + '下载模型 ZIP</button></div></section>' +
@@ -946,8 +950,10 @@ function openExport() {
     '<div id="exportStatus" class="export-status" aria-live="polite" hidden></div></div>', 'export-dialog');
   dialog.querySelectorAll('[name="format"]').forEach(input => input.onchange = () => {
     exportOptions.formats = [...dialog.querySelectorAll('[name="format"]:checked')].map(element => element.value);
+    $('#simplifyUrdf').disabled = !exportOptions.formats.includes('urdf');
   });
   $('#mergeMeshes').onchange = event => { exportOptions.merge = event.currentTarget.checked; };
+  $('#simplifyUrdf').onchange = event => { exportOptions.simplify_urdf = event.currentTarget.checked; };
   dialog.querySelector('[data-field="training"]').onchange = event => { exportOptions.training = event.currentTarget.value; };
   $('#testPose').onclick = () => { inspector = 'pose'; dialog.close(); render(); };
   $('#verifyModel').onclick = () => verifyModel();
@@ -965,7 +971,8 @@ function showStatus(messages, error = false) {
 
 async function verifyModel() {
   try {
-    const data = await (await projectApi('validate', { project, formats: exportOptions.formats, merge: exportOptions.merge })).json();
+    const { formats, merge, simplify_urdf } = exportOptions;
+    const data = await (await projectApi('validate', { project, formats, merge, simplify_urdf })).json();
     showStatus([...(data.errors.length ? data.errors : ['模型校验通过。']), ...data.warnings], Boolean(data.errors.length));
   } catch (error) { showStatus([error.message], true); }
 }
@@ -976,7 +983,7 @@ async function downloadExport(training = null) {
   showStatus(['正在生成导出包…']);
   try {
     const response = await projectApi('export', { project, formats: training ? [] : exportOptions.formats,
-      merge: exportOptions.merge, training });
+      merge: exportOptions.merge, simplify_urdf: !training && exportOptions.simplify_urdf, training });
     const filename = response.headers.get('Content-Disposition')?.match(/filename="([^"]+)"/)?.[1] ?? 'robot.zip';
     download(await response.blob(), filename);
     showStatus([training ? '训练工程已生成。解压后查看 TRAINING.md。' : '模型已打包。']);

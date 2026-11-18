@@ -5,7 +5,9 @@ import json
 import math
 import xml.etree.ElementTree as ET
 import zipfile
+from threading import Lock
 
+import fast_simplification
 import mujoco
 import numpy as np
 import trimesh
@@ -13,6 +15,9 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 from trimesh.geometry import align_vectors
 
 from .model import Project, configuration_at_zero, frame, hierarchy, identifier, numbers, points_in, properties, quaternion, tensor_values, validate, xyz_rpy
+
+
+SIMPLIFICATION_LOCK = Lock()
 
 
 def xml_bytes(root):
@@ -25,23 +30,71 @@ def local_mesh(part, world_to_link):
                            faces=part["faces"], process=False)
 
 
-def geometries(link, parts, transform, merge):
+def simplify_mesh(mesh):
+    if len(mesh.faces) <= 128:
+        return mesh
+
+    # STEP tessellation stores a separate set of vertices for each CAD face.
+    welded = mesh.copy()
+    welded.merge_vertices()
+    welded.update_faces(welded.unique_faces() & welded.nondegenerate_faces())
+    welded.remove_unreferenced_vertices()
+    if not len(welded.faces):
+        return mesh
+    target = max(64, math.ceil(len(welded.faces) * 0.35))
+    if target >= len(welded.faces):
+        return welded
+
+    # Normalize the part so the error metric is independent of its absolute size and position.
+    center = welded.bounds.mean(axis=0)
+    scale = welded.extents.max()
+    # The native wrapper uses shared buffers across calls.
+    with SIMPLIFICATION_LOCK:
+        vertices, faces = fast_simplification.simplify(
+            (welded.vertices - center) / scale, welded.faces, target_count=target, agg=5, preserve_border=True,
+        )
+    if not 0 < len(faces) < len(welded.faces) or not np.isfinite(vertices).all():
+        return welded
+    reduced = trimesh.Trimesh(vertices=vertices * scale + center, faces=faces, process=False)
+    if not reduced.nondegenerate_faces().all():
+        return welded
+    margin = np.maximum(welded.extents * 0.005, 1e-8)
+    if np.any(np.abs(reduced.bounds - welded.bounds) > margin):
+        return welded
+    if welded.is_watertight and (not reduced.is_watertight or reduced.euler_number != welded.euler_number):
+        return welded
+    if welded.is_winding_consistent and not reduced.is_winding_consistent:
+        return welded
+    return reduced
+
+
+def geometries(link, parts, transform, merge, *, simplify=False):
     inverse = np.linalg.inv(transform)
+    meshes_by_part = {}
+    meshes_by_group = {}
     for role in ("visual", "collision"):
         if role == "collision" and link.collision == "none":
             continue
-        source = [parts[part] for part in link.parts if parts[part][role]]
+        source = [part for part in link.parts if parts[part][role]]
         if role == "collision" and not source:
-            source = [parts[part] for part in link.parts if parts[part]["visual"]]
-        meshes = [local_mesh(part, inverse) for part in source]
-        if role == "collision" and link.collision == "box" and meshes:
-            bounds = trimesh.util.concatenate(meshes).bounds
+            source = [part for part in link.parts if parts[part]["visual"]]
+        if role == "collision" and link.collision == "box" and source:
+            bounds = trimesh.util.concatenate([local_mesh(parts[part], inverse) for part in source]).bounds
             yield role, "box", np.maximum(bounds[1] - bounds[0], 0.0001), bounds.mean(axis=0), None
             continue
+        meshes = []
+        for key in source:
+            if key not in meshes_by_part:
+                mesh = local_mesh(parts[key], inverse)
+                meshes_by_part[key] = simplify_mesh(mesh) if simplify else mesh
+            meshes.append(meshes_by_part[key])
         if merge and meshes:
-            meshes = [trimesh.util.concatenate(meshes)]
+            group = tuple(source)
+            if group not in meshes_by_group:
+                meshes_by_group[group] = trimesh.util.concatenate(meshes)
+            meshes = [meshes_by_group[group]]
         for index, mesh in enumerate(meshes):
-            color = source[index]["color"]
+            color = parts[source[index]]["color"]
             yield role, "mesh", mesh, np.zeros(3), color
 
 
@@ -63,19 +116,22 @@ def joint_direction(joint, transform):
     return transform[:3, :3].T @ (direction / np.linalg.norm(direction))
 
 
-def make_urdf(project, data, archive):
-    _, _, transforms, _, geometry, masses = data
+def make_urdf(project, parts, archive, merge, geometry_frames, *, simplify=False):
+    _, _, transforms = hierarchy(project)
     robot = ET.Element("robot", name=identifier(project.name))
     for link in project.links:
         name = identifier(link.name)
         node = ET.SubElement(robot, "link", name=name)
-        mass, center, inertia = masses[link.id]
+        geometry_frame = geometry_frames[link.id]
+        mass, center, inertia = properties(link, parts, geometry_frame)
         inertial = ET.SubElement(node, "inertial")
         ET.SubElement(inertial, "origin", xyz=numbers(center), rpy="0 0 0")
         ET.SubElement(inertial, "mass", value=numbers([mass]))
         keys = ("ixx", "iyy", "izz", "ixy", "ixz", "iyz")
         ET.SubElement(inertial, "inertia", {key: numbers([value]) for key, value in zip(keys, tensor_values(inertia))})
-        for index, (role, kind, payload, center, color) in enumerate(geometry[link.id]):
+        mesh_paths = {}
+        geometry = geometries(link, parts, geometry_frame, merge, simplify=simplify)
+        for index, (role, kind, payload, center, color) in enumerate(geometry):
             label = f"{name}_{role}_{index}"
             item = ET.SubElement(node, role, name=label)
             ET.SubElement(item, "origin", xyz=numbers(center), rpy="0 0 0")
@@ -83,8 +139,12 @@ def make_urdf(project, data, archive):
             if kind == "box":
                 ET.SubElement(shape, "box", size=numbers(payload))
             else:
-                path = f"meshes/{label}.stl"
-                archive.writestr(path, trimesh.exchange.stl.export_stl(payload))
+                path = mesh_paths.get(id(payload))
+                if path is None:
+                    path = f"meshes/{label}.stl"
+                    archive.writestr(path, trimesh.exchange.stl.export_stl(payload))
+                    if simplify:
+                        mesh_paths[id(payload)] = path
                 ET.SubElement(shape, "mesh", filename=path)
             if color and role == "visual":
                 material = ET.SubElement(item, "material", name=f"{label}_material")
@@ -289,13 +349,14 @@ def check_export(project: Project, parts: dict, formats=()):
     return errors, warnings
 
 
-def inspect_export(project: Project, parts: dict, formats, merge):
+def inspect_export(project: Project, parts: dict, formats, merge, *, simplify_urdf=False):
     errors, warnings = check_export(project, parts, formats)
     if errors or not formats:
         return errors, warnings
     name = identifier(project.name)
     try:
-        with zipfile.ZipFile(io.BytesIO(export_zip(project, parts, formats, merge))) as archive:
+        bundle = export_zip(project, parts, formats, merge, simplify_urdf=simplify_urdf)
+        with zipfile.ZipFile(io.BytesIO(bundle)) as archive:
             if "urdf" in formats:
                 model = ET.fromstring(archive.read(f"{name}.urdf"))
                 for mesh in model.findall(".//mesh"):
@@ -316,7 +377,7 @@ def inspect_export(project: Project, parts: dict, formats, merge):
     return errors, warnings
 
 
-def export_zip(project: Project, parts: dict, formats, merge=False, training=None):
+def export_zip(project: Project, parts: dict, formats, merge=False, training=None, *, simplify_urdf=False):
     from .training import add_training
 
     formats = set(formats)
@@ -333,12 +394,15 @@ def export_zip(project: Project, parts: dict, formats, merge=False, training=Non
     has_zero = bool(project.zero_pose)
     _, _, geometry_frames = hierarchy(project)
     project = configuration_at_zero(project)
-    data = assembly(project, parts, merge, geometry_frames)
     name = identifier(project.name)
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         if "urdf" in formats:
-            archive.writestr(f"{name}.urdf", make_urdf(project, data, archive))
+            archive.writestr(f"{name}.urdf", make_urdf(
+                project, parts, archive, merge, geometry_frames, simplify=simplify_urdf,
+            ))
+        if "mjcf" in formats or "usd" in formats:
+            data = assembly(project, parts, merge, geometry_frames)
         if "mjcf" in formats:
             archive.writestr(f"{name}.xml", make_mjcf(project, data, archive))
         if "usd" in formats:
