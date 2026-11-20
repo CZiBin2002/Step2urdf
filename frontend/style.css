@@ -191,6 +191,29 @@ h4 { color: #d7e3ed; font-size: 12px; font-weight: 700; margin-bottom: 10px; }
 .inline-actions { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
 .inline-actions .button { min-height: 31px; padding: 0 9px; font-size: 11px; }
 .model-settings { margin-top: 12px; border: 1px solid var(--border); font-size: 11px; }
+.orientation { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.orientation h4 { font-size: 12px; margin-bottom: 6px; }
+.orientation p { color: var(--muted); font-size: 11px; line-height: 1.5; }
+.orientation-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.orientation-actions .button { min-height: 28px; padding: 0 8px; font-size: 11px; border: 1px solid var(--border); }
+dialog.busy {
+  position: fixed; inset: 0; width: fit-content; height: fit-content; max-width: calc(100vw - 36px);
+  max-height: none; margin: auto; padding: 0; border: 0; background: transparent;
+  box-shadow: none; overflow: visible;
+}
+dialog.busy::backdrop { background: #071018c4; }
+.busy-card {
+  width: min(420px, calc(100vw - 36px)); display: grid; justify-items: center; gap: 8px;
+  padding: 22px 20px; text-align: center; background: #17222d; border: 1px solid #3b5162;
+  border-radius: 13px; box-shadow: 0 28px 100px #05090dc0;
+}
+.busy-card strong { font-size: 15px; }
+.busy-card p { color: #a9bdc9; font-size: 12px; line-height: 1.5; }
+.spinner {
+  width: 28px; height: 28px; border-radius: 50%; border: 3px solid #2c4656;
+  border-top-color: var(--accent); animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
 .inspector-empty { min-height: 160px; display: grid; place-content: center; justify-items: center; text-align: center; gap: 13px; color: var(--muted); }
 .inspector-empty svg { width: 25px; height: 25px; color: #7da1b6; }
 .pose-list { display: grid; gap: 9px; margin: 12px 0; }

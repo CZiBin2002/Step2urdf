@@ -117,7 +117,7 @@ def joint_direction(joint, transform):
 
 
 def make_urdf(project, parts, archive, merge, geometry_frames, *, simplify=False):
-    _, _, transforms = hierarchy(project)
+    root, _, transforms = hierarchy(project)
     robot = ET.Element("robot", name=identifier(project.name))
     for link in project.links:
         name = identifier(link.name)
@@ -168,6 +168,16 @@ def make_urdf(project, parts, archive, merge, geometry_frames, *, simplify=False
             if joint.mimic is not None:
                 ET.SubElement(item, "mimic", joint=joint_names[joint.mimic.joint],
                               multiplier=str(joint.mimic.multiplier), offset=str(joint.mimic.offset))
+    world = frame(project.world_origin, project.world_rpy)
+    if project.fixed_base and not np.allclose(world, np.eye(4), atol=1e-8):
+        used = set(names.values())
+        world_name = "world" if "world" not in used else "world_frame"
+        ET.SubElement(robot, "link", name=world_name)
+        item = ET.SubElement(robot, "joint", name="world_joint", type="fixed")
+        ET.SubElement(item, "parent", link=world_name)
+        ET.SubElement(item, "child", link=names[root.id])
+        origin, rpy = xyz_rpy(world)
+        ET.SubElement(item, "origin", xyz=numbers(origin), rpy=numbers(rpy))
     return xml_bytes(robot)
 
 

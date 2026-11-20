@@ -18,7 +18,7 @@ cd Step2urdf
 
 也可以在资源管理器中双击 `start.cmd`。脚本会准备 `.venv`、安装依赖、构建前端并启动服务。前端依赖清单未变时，脚本会复用已安装的包。如果现有 `.venv` 无法运行，脚本会将它备份为 `venv.bak` 后重建。
 
-服务启动后，在浏览器打开 [本地工作台](http://127.0.0.1:8765/)。首次打开会载入 Atlas R6 示例。按 Ctrl+C 可停止服务。修改前端后，重启 `start.cmd` 即可重新构建。
+服务启动后，在浏览器打开 [本地工作台](http://127.0.0.1:18765/)。首次打开会载入 Atlas R6 示例。按 Ctrl+C 可停止服务。修改前端后，重启 `start.cmd` 即可重新构建。
 
 ## 使用教程
 
@@ -78,7 +78,7 @@ URDF 的关节树需要一个根 Link，每个子 Link 只能有一个父关节�
 
 ## 常见问题
 
-- **浏览器打不开工作台。** 检查启动终端是否在运行，以及终端显示的端口是否为 8765。修改前端源码后，重新执行 `npm.cmd run build` 并重启服务。
+- **浏览器打不开工作台。** 检查启动终端是否在运行，以及终端显示的端口是否为 18765。修改前端源码后，重新执行 `npm.cmd run build` 并重启服务。
 - **3D 区域显示 WebGL 错误。** 用支持 WebGL 的浏览器打开，检查浏览器的图形加速设置。
 - **导入 URDF 时提示缺少网格。** 选择包含主文件与网格的目录或 ZIP，保留原来的资源相对路径。
 - **导出提示有未分配零件。** 在 **零件 → 仅显示未分配零件** 中检查遗漏，并把希望导出的零件分配到 Link。
@@ -110,6 +110,6 @@ def suggest_links(structure: dict) -> list[dict]:
 
 ## 开发
 
-前端位于 `frontend/`，转换与导出服务位于 `workbench/`。启动后端后，在另一个终端执行 `npm.cmd run dev`，打开 Vite 打印的地址。后端运行时，可访问 [本地 API 文档](http://127.0.0.1:8765/docs)。
+前端位于 `frontend/`，转换与导出服务位于 `workbench/`。启动后端后，在另一个终端执行 `npm.cmd run dev`，打开 Vite 打印的地址。后端运行时，可访问 [本地 API 文档](http://127.0.0.1:18765/docs)。
 
 交互流程参考 [StackForce CAD2URDF](https://cad2urdf.stackforce.cc/upload?workbenchEmbed=1)。Step2URDF 的工程文件独立保存。训练配置参考 [Isaac Lab](https://github.com/isaac-sim/IsaacLab) 和 [MJLab](https://github.com/mujocolab/mjlab) 的公开接口。
