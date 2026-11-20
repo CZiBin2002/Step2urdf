@@ -1,6 +1,6 @@
 # Step2URDF
 
-Step2URDF 是本地运行的机器人 CAD 工作台。导入 STEP 装配后，可以在 3D 视图中把零件分成刚体（Link），配置关节和零位，再导出 URDF、MJCF、USD 或强化学习工程。
+Step2URDF 是本地或局域网运行的机器人 CAD 工作台。导入 STEP 装配后，可以在 3D 视图中把零件分成刚体（Link），配置关节、零位和整机朝向，再导出 URDF、MJCF、USD 或强化学习工程。AI 通过 MCP 操作同一份工程，已打开的页面会显示这些修改。
 
 ## v0.2.0
 
@@ -11,7 +11,7 @@ Step2URDF 是本地运行的机器人 CAD 工作台。导入 STEP 装配后，�
 以下命令适用于 Windows PowerShell。先安装 Git、64 位 Python 3.13 和 Node.js 22.12 或更新的受支持版本。安装后可用 `python --version` 和 `node --version` 检查环境。
 
 ```powershell
-git clone https://github.com/CZiBin2002/Step2urdf.git
+git clone https://github.com/ceoifung/Step2urdf.git
 cd Step2urdf
 .\start.cmd
 ```
@@ -19,6 +19,8 @@ cd Step2urdf
 也可以在资源管理器中双击 `start.cmd`。脚本会准备 `.venv`、安装依赖、构建前端并启动服务。前端依赖清单未变时，脚本会复用已安装的包。如果现有 `.venv` 无法运行，脚本会将它备份为 `venv.bak` 后重建。
 
 服务启动后，在浏览器打开 [本地工作台](http://127.0.0.1:18765/)。首次打开会载入 Atlas R6 示例。按 Ctrl+C 可停止服务。修改前端后，重启 `start.cmd` 即可重新构建。
+
+用 Docker 部署到本机或 NAS 时，按 [DEPLOY.md](DEPLOY.md) 构建。网页在 `18765`，MCP 在 `18766`。
 
 ## 使用教程
 
@@ -39,6 +41,12 @@ cd Step2urdf
 5. **保存与导出。** 点击 **保存工程** 下载 `.cad2urdf.json`。可在 **导入模型 → 本地工程缓存** 重新打开缓存，或导入备份继续编辑。在 **测试与导出** 选择格式，先校验模型，再下载 ZIP。校验会检查关节树及所选格式的模型资源。启用合并 STL 时，视觉网格与碰撞网格会按 Link 分别合并。
 
 URDF 的关节树需要一个根 Link，每个子 Link 只能有一个父关节。STEP 的几何和装配关系可用来推断 Link 和转轴。运动范围、舵机零点、传动关系等参数需要结合实际机构确认。
+
+### 调整整机朝向
+
+模型平放的装配在视图里侧躺时，打开检查器的 **整机朝向**，绕 X、Y 或 Z 转 90 度。旋转以装配包围盒中心为轴，模型会留在视野中。CAD 常见 Y 轴向上，工作台使用 Z 轴向上，这时通常绕 X 轴转 90 度。也可以在模型基准里填写 `world_rpy`，单位是弧度，`π/2` 约为 `1.5708`。
+
+该姿态会作用到预览。固定基座导出 URDF 时，若姿态不是单位阵，会增加一个名为 `world` 的固定关节。浮动基座的 URDF 仍使用模型自身的根连杆姿态。MJCF 和 USD 导出已包含这一整机姿态。
 
 ### 导出精简 URDF
 
@@ -86,6 +94,31 @@ URDF 的关节树需要一个根 Link，每个子 Link 只能有一个父关节�
 CAD、工程缓存和生成文件默认保存在本机。工作台缓存目录为 `.projects/`，可用 **保存工程** 将项目备份到其他位置。
 
 ## 接入 AI
+
+点击顶部 **MCP 接入**。对话框里是当前网站的接入说明，点 **复制给 AI** 即可。默认不设置 Token。
+
+工作台是 `18765`，MCP 是 `18766`。本机配置如下，局域网或 NAS 上把主机名换成那台机器的地址：
+
+```json
+{
+  "mcpServers": {
+    "step2urdf": {
+      "type": "http",
+      "url": "http://127.0.0.1:18766/mcp"
+    }
+  }
+}
+```
+
+配置完成后，用日常说法告诉 AI 要做什么，例如导入某个模型、调整朝向、划分 Link 或导出 URDF。AI 接到的是工具列表，按你的要求调用。已打开的工作台会显示导入进度，并跟着更新名称、Link、关节和朝向。Docker、目录约定和对外暴露时的 Token 见 [DEPLOY.md](DEPLOY.md)。
+
+### 上传技能
+
+MCP 只能读到部署机器上的路径，读不到你电脑里的 `D:\模型.stp`。把本地文件交给 AI 时，先下载上传技能。页面里有 **下载上传技能**，地址是工作台的 `/skill/step2urdf-upload.zip`。解压到当前 AI 客户端的 skills 目录，文件夹名保持 `step2urdf-upload`。这是通用 Agent Skill，不限定某一种编辑器。
+
+技能把文件 POST 到同一台工作台的 `/api/import`，表单字段名是 `files`。文件已经在部署目录的 `data/in/` 里时，AI 调用 `import_model`，路径写成 `in/文件名`。
+
+### 自定义 Link 建议
 
 检查器的「AI 建议」默认使用本地几何规则。可导出带版本的结构 JSON，或用 `POST /api/projects/{id}/structure` 获取包含装配路径、质心、包围盒及圆柱特征的结构数据。请求体是当前的 Project，API schema 可在本地 `/docs` 查看。
 
