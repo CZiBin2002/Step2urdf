@@ -33,17 +33,39 @@
       <div id="tree-actions" class="panel-bottom"></div>
     </aside>
     <section id="viewport" class="viewport" aria-label="机器人三维预览">
-      <div id="canvasHost" class="canvas-host"></div>
-      <div class="viewport-title"><span class="status-dot"></span><span>3D 视图</span><span class="viewport-label">透视</span></div>
-      <div class="view-tools">
-        <button id="fit" class="icon-button" title="适配视图" aria-label="适配视图"><i data-lucide="maximize"></i></button>
-        <button id="topView" class="icon-button" title="顶视图" aria-label="顶视图"><i data-lucide="arrow-down-to-line"></i></button>
-        <button id="showCollisions" class="icon-button" aria-pressed="false" title="显示碰撞体" aria-label="显示碰撞体"><i data-lucide="scan-line"></i></button>
-        <button id="resetPose" class="icon-button" title="重置关节姿态" aria-label="重置关节姿态"><i data-lucide="rotate-ccw"></i></button>
+      <div id="canvasHost" class="canvas-host" aria-hidden="true"></div>
+      <div class="viewport-layout">
+        <div class="model-view">
+          <div class="view-toolbar">
+            <div class="view-directions" role="group" aria-label="模型视角">
+              <button type="button" data-view="front" aria-pressed="false">正面</button>
+              <button type="button" data-view="side" aria-pressed="false">侧面</button>
+              <button type="button" data-view="top" aria-pressed="false">俯视</button>
+              <button type="button" data-view="perspective" aria-pressed="true">斜视</button>
+            </div>
+            <div class="view-tools">
+              <button id="fit" class="icon-button" title="适配全身" aria-label="适配全身"><i data-lucide="scan"></i></button>
+              <button id="showCollisions" class="icon-button" aria-pressed="false" title="显示碰撞体" aria-label="显示碰撞体"><i data-lucide="scan-line"></i></button>
+              <button id="resetPose" class="icon-button" title="重置关节姿态" aria-label="重置关节姿态"><i data-lucide="rotate-ccw"></i></button>
+              <button id="showCamera" class="icon-button" aria-controls="cameraPreview" aria-pressed="false" title="摄像头预览" aria-label="摄像头预览"><i data-lucide="camera"></i></button>
+              <button id="expandView" class="icon-button" aria-pressed="false" title="全屏预览" aria-label="全屏预览"><i data-lucide="maximize"></i></button>
+            </div>
+          </div>
+          <div id="modelStage" class="model-stage">
+            <div class="view-axes" aria-label="Z 轴朝上"><span class="z">Z</span><span class="x">X</span><span class="y">Y</span></div>
+            <div class="view-hint"><i data-lucide="mouse"></i>拖动旋转 <b>·</b> 滚轮缩放 <b>·</b> 右键平移</div>
+            <div id="viewMessage" class="view-message">正在载入模型…</div>
+          </div>
+        </div>
+        <section id="cameraPreview" class="camera-preview" aria-label="摄像头模拟画面" hidden>
+          <div class="camera-preview-header">
+            <span>摄像头 · 模拟画面</span>
+            <button id="previewCameraSettings" class="icon-button" title="摄像头设置" aria-label="摄像头设置"><i data-lucide="sliders-horizontal"></i></button>
+            <button id="hideCamera" class="icon-button" title="收起摄像头预览" aria-label="收起摄像头预览"><i data-lucide="x"></i></button>
+          </div>
+          <div id="cameraScreen" class="camera-screen"></div>
+        </section>
       </div>
-      <div class="view-axes" aria-label="Z 轴朝上"><span class="z">Z</span><span class="x">X</span><span class="y">Y</span></div>
-      <div class="view-hint"><i data-lucide="mouse"></i>拖动旋转 <b>·</b> 滚轮缩放 <b>·</b> 右键平移</div>
-      <div id="viewMessage" class="view-message">正在载入示例模型…</div>
     </section>
     <aside class="inspector" aria-label="属性与建议">
       <div class="panel-title"><i data-lucide="sliders-horizontal"></i><h2>检查器</h2><button id="help" class="icon-button" aria-label="帮助" title="帮助"><i data-lucide="circle-help"></i></button></div>

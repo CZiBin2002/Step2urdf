@@ -14,6 +14,7 @@ import trimesh
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 from trimesh.geometry import align_vectors
 
+from .collision_geometry import collision_meshes
 from .model import Project, configuration_at_zero, frame, hierarchy, identifier, numbers, points_in, properties, quaternion, tensor_values, validate, xyz_rpy
 
 
@@ -75,6 +76,10 @@ def geometries(link, parts, transform, merge, *, simplify=False):
     for role in ("visual", "collision"):
         if role == "collision" and link.collision == "none":
             continue
+        if role == "collision" and link.collision == "convex":
+            for mesh in collision_meshes(link, parts, transform):
+                yield role, "mesh", mesh, np.zeros(3), None
+            continue
         source = [part for part in link.parts if parts[part][role]]
         if role == "collision" and not source:
             source = [part for part in link.parts if parts[part]["visual"]]
@@ -116,8 +121,50 @@ def joint_direction(joint, transform):
     return transform[:3, :3].T @ (direction / np.linalg.norm(direction))
 
 
+def add_urdf_camera(robot, camera, parent):
+    used_links = {node.get("name") for node in robot.findall("link")}
+    used_joints = {node.get("name") for node in robot.findall("joint")}
+    base, index = "camera", 1
+    while {f"{base}_link", f"{base}_optical_frame"} & used_links or (
+        {f"{base}_joint", f"{base}_optical_joint"} & used_joints
+    ):
+        index += 1
+        base = f"camera_{index}"
+    mount, optical = f"{base}_link", f"{base}_optical_frame"
+    for name, child, attached_to, xyz, rpy in (
+        (f"{base}_joint", mount, parent, camera.origin, camera.rpy),
+        (f"{base}_optical_joint", optical, mount, (0, 0, 0), (-math.pi / 2, 0, -math.pi / 2)),
+    ):
+        ET.SubElement(robot, "link", name=child)
+        joint = ET.SubElement(robot, "joint", name=name, type="fixed")
+        ET.SubElement(joint, "parent", link=attached_to)
+        ET.SubElement(joint, "child", link=child)
+        ET.SubElement(joint, "origin", xyz=numbers(xyz), rpy=numbers(rpy))
+
+    # Attach the sensor to the physical Link so Gazebo can reduce the empty fixed frames.
+    gazebo = ET.SubElement(robot, "gazebo", reference=parent)
+    sensor = ET.SubElement(gazebo, "sensor", name=base, type="camera")
+    prefix = f"/{robot.get('name')}/{base}"
+    ET.SubElement(sensor, "pose").text = numbers((*camera.origin, *camera.rpy))
+    ET.SubElement(sensor, "always_on").text = "true"
+    ET.SubElement(sensor, "update_rate").text = numbers([camera.fps])
+    ET.SubElement(sensor, "topic").text = f"{prefix}/image"
+    ET.SubElement(sensor, "gz_frame_id").text = optical
+    settings = ET.SubElement(sensor, "camera")
+    ET.SubElement(settings, "horizontal_fov").text = numbers([camera.horizontal_fov])
+    ET.SubElement(settings, "optical_frame_id").text = optical
+    ET.SubElement(settings, "camera_info_topic").text = f"{prefix}/camera_info"
+    image = ET.SubElement(settings, "image")
+    ET.SubElement(image, "width").text = str(camera.width)
+    ET.SubElement(image, "height").text = str(camera.height)
+    ET.SubElement(image, "format").text = "R8G8B8"
+    clip = ET.SubElement(settings, "clip")
+    ET.SubElement(clip, "near").text = numbers([camera.near])
+    ET.SubElement(clip, "far").text = numbers([camera.far])
+
+
 def make_urdf(project, parts, archive, merge, geometry_frames, *, simplify=False):
-    _, _, transforms = hierarchy(project)
+    root, _, transforms = hierarchy(project)
     robot = ET.Element("robot", name=identifier(project.name))
     for link in project.links:
         name = identifier(link.name)
@@ -151,6 +198,22 @@ def make_urdf(project, parts, archive, merge, geometry_frames, *, simplify=False
                 ET.SubElement(material, "color", rgba=numbers([*color_values(color), 1]))
     names = {link.id: identifier(link.name) for link in project.links}
     joint_names = {joint.id: identifier(joint.name) for joint in project.joints}
+    root_pose = frame(project.world_origin, project.world_rpy) @ transforms[root.id]
+    if project.fixed_base and not np.allclose(root_pose, np.eye(4), atol=1e-10):
+        # URDF has no root origin attribute. Preserve the configured CAD-to-world
+        # orientation and placement with an explicit fixed reference frame.
+        reference, index = 'world', 1
+        while reference in names.values():
+            reference, index = f'world_{index}', index + 1
+        fixed_name, index = 'world_fixed', 1
+        while fixed_name in joint_names.values():
+            fixed_name, index = f'world_fixed_{index}', index + 1
+        ET.SubElement(robot, 'link', name=reference)
+        fixed = ET.SubElement(robot, 'joint', name=fixed_name, type='fixed')
+        ET.SubElement(fixed, 'parent', link=reference)
+        ET.SubElement(fixed, 'child', link=names[root.id])
+        xyz, rpy = xyz_rpy(root_pose)
+        ET.SubElement(fixed, 'origin', xyz=numbers(xyz), rpy=numbers(rpy))
     for joint in project.joints:
         item = ET.SubElement(robot, "joint", name=identifier(joint.name), type=joint.type)
         ET.SubElement(item, "parent", link=names[joint.parent])
@@ -168,6 +231,16 @@ def make_urdf(project, parts, archive, merge, geometry_frames, *, simplify=False
             if joint.mimic is not None:
                 ET.SubElement(item, "mimic", joint=joint_names[joint.mimic.joint],
                               multiplier=str(joint.mimic.multiplier), offset=str(joint.mimic.offset))
+    if project.camera is not None:
+        add_urdf_camera(robot, project.camera, names[project.camera.parent])
+    if project.imu is not None:
+        mount = names[project.imu.parent]
+        gazebo = ET.SubElement(robot, "gazebo", reference=mount)
+        sensor = ET.SubElement(gazebo, "sensor", name="imu", type="imu")
+        ET.SubElement(sensor, "always_on").text = "true"
+        ET.SubElement(sensor, "topic").text = f"/{robot.get('name')}/imu"
+        ET.SubElement(sensor, "gz_frame_id").text = mount
+        ET.SubElement(sensor, "imu")
     return xml_bytes(robot)
 
 
@@ -346,6 +419,10 @@ def check_export(project: Project, parts: dict, formats=()):
         errors.append("标准 URDF 不支持闭链或球铰。请选择 MJCF 或 USD，或编辑为可导出的关节树。")
     if "usd" in formats and any(joint.mimic for joint in project.joints):
         errors.append("当前 USD 导出无法保留线性关节耦合。请选择 URDF 或 MJCF。")
+    if project.camera is not None and {"mjcf", "usd"}.intersection(formats):
+        warnings.append("摄像头传感器配置仅包含在 URDF 导出中。")
+    if project.imu is not None and {"mjcf", "usd"}.intersection(formats):
+        warnings.append("IMU 传感器配置仅包含在 URDF 导出中。")
     return errors, warnings
 
 

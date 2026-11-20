@@ -27,7 +27,7 @@ class Link(Model):
     mass: float | None = Field(default=None, gt=0)
     center: Vec3 | None = None
     inertia: tuple[float, float, float, float, float, float] | None = None
-    collision: Literal["mesh", "box", "none"] = "mesh"
+    collision: Literal["convex", "mesh", "box", "none"] = "convex"
 
 
 class Mimic(Model):
@@ -61,15 +61,35 @@ class Loop(Model):
     anchor: Vec3 = ZERO
 
 
+class Camera(Model):
+    parent: str
+    # Pose in the parent Link frame, with +X forward and +Z up.
+    origin: Vec3 = ZERO
+    rpy: Vec3 = ZERO
+    width: int = Field(default=1920, ge=1, le=8192)
+    height: int = Field(default=1080, ge=1, le=8192)
+    horizontal_fov: float = Field(default=1.2217304763960306, gt=0, lt=np.pi)
+    fps: float = Field(default=30, gt=0)
+    near: float = Field(default=0.005, gt=0)
+    far: float = Field(default=20, gt=0)
+
+
+class Imu(Model):
+    parent: str  # The mounting Link's frame is the sensor frame.
+
+
 class Project(Model):
     name: str
     links: list[Link] = Field(default_factory=list)
     joints: list[Joint] = Field(default_factory=list)
     loops: list[Loop] = Field(default_factory=list)
+    camera: Camera | None = None
+    imu: Imu | None = None
     world_origin: Vec3 = ZERO
     world_rpy: Vec3 = ZERO
     fixed_base: bool = True
     zero_pose: dict[str, float] = Field(default_factory=dict)
+    collision_assembly_policy: Literal["exclude", "strict"] = "exclude"
 
 
 def identifier(value: str, fallback: str = "robot") -> str:
@@ -178,6 +198,13 @@ def validate(project: Project, parts: dict) -> tuple[list[str], list[str]]:
     for loop in project.loops:
         if loop.first not in links or loop.second not in links or loop.first == loop.second:
             errors.append(f"闭链 {loop.name} 的两个 Link 无效。")
+    if project.camera is not None:
+        if project.camera.parent not in links:
+            errors.append("摄像头的安装 Link 无效。")
+        if project.camera.near >= project.camera.far:
+            errors.append("摄像头的远裁剪距离必须大于近裁剪距离。")
+    if project.imu is not None and project.imu.parent not in links:
+        errors.append("IMU 的安装 Link 无效。")
     if not errors and project.zero_pose:
         try:
             configuration_at_zero(project)
@@ -253,8 +280,8 @@ def configuration_at_zero(project: Project) -> Project:
             new_joint.anchor = new_link.origin
             new_joint.axis = tuple(parent_delta[:3, :3] @ axis)
             if joint.type in {"revolute", "prismatic"}:
-                new_joint.lower = min(0.0, joint.lower - value)
-                new_joint.upper = max(0.0, joint.upper - value)
+                new_joint.lower = joint.lower - value
+                new_joint.upper = joint.upper - value
             if new_joint.mimic is not None:
                 new_joint.mimic.offset = 0.0
             stack.append(child)

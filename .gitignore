@@ -222,3 +222,4 @@ __marimo__/
 /node_modules/
 /.projects/
 /exports/
+/MUJOCO_LOG.TXT

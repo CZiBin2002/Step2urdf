@@ -4,6 +4,8 @@ import json
 import os
 import re
 import tempfile
+from collections import OrderedDict
+from threading import RLock
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -14,9 +16,11 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from .demo import demo
+from .collision_geometry import collision_meshes
+from .collisions import CollisionScene
 from .exporters import export_zip, inspect_export
 from .importers import MODEL_TYPES, import_model
 from .model import Model, Project, frame, identifier, properties, tensor_values
@@ -27,6 +31,8 @@ CACHE = Path(os.environ.get("STEP2URDF_PROJECTS", ROOT / ".projects"))
 UPLOAD_LIMIT = 200 * 1024 * 1024
 FILE_LIMIT = 4096
 app = FastAPI(title="Step2URDF API")
+_scenes = OrderedDict()
+_scenes_lock = RLock()
 
 
 class ExportRequest(Model):
@@ -43,13 +49,46 @@ class AxisRequest(Model):
     child: str
 
 
-def read_job(job: str):
+class MotionRequest(Model):
+    project: Project
+    start: dict[str, float] = Field(default_factory=dict)
+    target: dict[str, float] = Field(default_factory=dict)
+
+
+class LimitsRequest(Model):
+    project: Project
+    pose: dict[str, float] = Field(default_factory=dict)
+    joint: str
+    linear_span: float = Field(default=0.5, gt=0, le=5)
+
+
+def collision_scene(job, project):
+    # Motion coordinates and bounds do not change collision geometry or CAD frames.
+    topology = project.model_dump(exclude={"zero_pose", "world_origin", "world_rpy", "camera", "imu"})
+    for joint in topology["joints"]:
+        for key in ("lower", "upper", "effort", "velocity", "damping", "friction"):
+            joint.pop(key)
+    key = (job, json.dumps(topology, sort_keys=True))
+    with _scenes_lock:
+        if key not in _scenes:
+            _scenes[key] = CollisionScene(project, read_job(job)["parts"])
+            while len(_scenes) > 3:
+                _scenes.popitem(last=False)
+        _scenes.move_to_end(key)
+        return _scenes[key]
+
+
+def job_path(job: str):
     if not re.fullmatch("[a-f0-9]{32}", job):
         raise HTTPException(404, "项目不存在。")
     path = CACHE / f"{job}.json"
     if not path.is_file():
         raise HTTPException(404, "项目不存在。")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return path
+
+
+def read_job(job: str):
+    return json.loads(job_path(job).read_text(encoding="utf-8"))
 
 
 def persist(job: str, payload: dict):
@@ -86,7 +125,8 @@ def safe_name(name):
 
 def read_assets(files, root):
     written = {}
-    total = 0
+    uploaded_bytes = 0
+    asset_bytes = 0
 
     def save(name, data):
         relative = safe_name(name)
@@ -98,23 +138,27 @@ def read_assets(files, root):
         written[relative.as_posix().casefold()] = target
 
     for file in files:
-        raw = file.file.read(UPLOAD_LIMIT - total + 1)
-        total += len(raw)
-        if total > UPLOAD_LIMIT:
+        raw = file.file.read(UPLOAD_LIMIT - uploaded_bytes + 1)
+        uploaded_bytes += len(raw)
+        if uploaded_bytes > UPLOAD_LIMIT:
             raise ValueError("文件总大小超过 200 MB。")
         name = file.filename or "model"
         if Path(name).suffix.lower() != ".zip":
+            asset_bytes += len(raw)
+            if asset_bytes > UPLOAD_LIMIT:
+                raise ValueError("模型与解压后的资源总大小超过 200 MB。")
             save(name, raw)
             continue
         with ZipFile(BytesIO(raw)) as archive:
             entries = [entry for entry in archive.infolist() if not entry.is_dir()]
-            if len(entries) + len(written) > FILE_LIMIT or sum(e.file_size for e in entries) + total > UPLOAD_LIMIT:
+            if (len(entries) + len(written) > FILE_LIMIT
+                    or asset_bytes + sum(entry.file_size for entry in entries) > UPLOAD_LIMIT):
                 raise ValueError("ZIP 解压后超过文件数或大小限制。")
             for entry in entries:
                 if entry.filename.startswith("__MACOSX/"):
                     continue
                 save(entry.filename, archive.read(entry))
-                total += entry.file_size
+                asset_bytes += entry.file_size
     return list(written.values())
 
 
@@ -147,7 +191,7 @@ def projects():
 
 @app.get("/api/projects/{job}")
 def get_project(job: str):
-    return read_job(job)
+    return Response(job_path(job).read_bytes(), media_type="application/json")
 
 
 @app.post("/api/demo/{sample}")
@@ -225,6 +269,41 @@ def axes(job: str, request: AxisRequest):
     try:
         return axis_suggestions(structure(request.project, read_job(job)["parts"]), request.parent, request.child)
     except (ValueError, KeyError) as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.post("/api/projects/{job}/collision-geometry")
+def collision_geometry(job: str, project: Project):
+    try:
+        parts = read_job(job)["parts"]
+        incoming = {joint.child: joint for joint in project.joints}
+        result = {}
+        for link in project.links:
+            transform = frame(incoming[link.id].anchor if link.id in incoming else link.origin, link.rpy)
+            meshes = collision_meshes(link, parts, transform)
+            result[link.id] = [{"vertices": mesh.vertices.tolist(), "faces": mesh.faces.tolist()} for mesh in meshes]
+        return result
+    except (ValueError, RuntimeError, KeyError) as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.post("/api/projects/{job}/motion")
+def check_motion(job: str, request: MotionRequest):
+    try:
+        scene = collision_scene(job, request.project)
+        with scene.lock:
+            return scene.sweep(request.project, request.start, request.target)
+    except (ValueError, RuntimeError, KeyError) as error:
+        raise HTTPException(422, str(error)) from error
+
+
+@app.post("/api/projects/{job}/collision-limits")
+def collision_limits(job: str, request: LimitsRequest):
+    try:
+        scene = collision_scene(job, request.project)
+        with scene.lock:
+            return scene.limits(request.project, request.pose, request.joint, request.linear_span)
+    except (ValueError, RuntimeError, KeyError) as error:
         raise HTTPException(422, str(error)) from error
 
 

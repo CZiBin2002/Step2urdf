@@ -1,19 +1,20 @@
 import {
-  ArrowDownToLine, ArrowRight, Box, Check, ChevronDown, CircleHelp, CloudUpload,
+  ArrowRight, Box, Camera, Check, ChevronDown, CircleHelp, CloudUpload,
   Download, Eye, EyeOff, FileCode, Folder, FolderOpen, GitBranch, Layers3, Link2,
-  Maximize, Mouse, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
+  Maximize, Minimize, Mouse, Plus, Redo2, RotateCcw, Save, Scan, ScanLine, Search, SlidersHorizontal,
   Sparkles, Trash2, Undo2, X, createIcons,
 } from 'lucide';
 
 import './style.css';
 import { Viewer, jointCoordinate } from './viewer.js';
+import { absolutePose, jointReviewGroup, poseRange, relativePose, reverseJointDirection } from './motion.js';
 
 const $ = selector => document.querySelector(selector);
 const icon = name => '<i data-lucide="' + name + '"></i>';
 const icons = {
-  ArrowDownToLine, ArrowRight, Box, Check, ChevronDown, CircleHelp, CloudUpload,
+  ArrowRight, Box, Camera, Check, ChevronDown, CircleHelp, CloudUpload,
   Download, Eye, EyeOff, FileCode, Folder, FolderOpen, GitBranch, Layers3, Link2,
-  Maximize, Mouse, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
+  Maximize, Minimize, Mouse, Plus, Redo2, RotateCcw, Save, Scan, ScanLine, Search, SlidersHorizontal,
   Sparkles, Trash2, Undo2, X,
 };
 const paintIcons = () => createIcons({ icons, attrs: { 'stroke-width': 1.65 } });
@@ -39,7 +40,19 @@ let expanded = new Set();
 let folded = new Set();
 let onlyUnassigned = false;
 let pose = {};
+let previewPose = null;
+let poseFrame = null;
+let motionTimer = null;
+let motionRevision = 0;
+let motionBusy = false;
+let configurationBusy = false;
+let pendingMotion = null;
+let collisionGeometryKey = '';
 let collisions = false;
+let checkCollisions = true;
+let cameraVisible = false;
+let jointReviews = new Map();
+let openPoseGroups = null;
 let undo = [];
 let redo = [];
 let aiResult;
@@ -56,7 +69,7 @@ let exportOptions = { formats: ['urdf'], merge: false, simplify_urdf: false, tra
 const dialog = $('#dialog');
 let viewer;
 try {
-  viewer = new Viewer($('#canvasHost'), selectPart);
+  viewer = new Viewer($('#canvasHost'), $('#modelStage'), selectPart, $('#cameraScreen'), markView);
 } catch {
   $('#viewMessage').textContent = '此设备无法初始化 WebGL，仍可编辑结构和导出模型。';
 }
@@ -102,7 +115,18 @@ function cacheProject(reportError = true) {
   return saveRequest;
 }
 
+function invalidateMotion() {
+  motionRevision++;
+  pendingMotion = null;
+  previewPose = null;
+  clearTimeout(motionTimer);
+  motionTimer = null;
+  if (poseFrame !== null) cancelAnimationFrame(poseFrame);
+  poseFrame = null;
+}
+
 function edit(mutate) {
+  invalidateMotion();
   undo.push(clone(project));
   if (undo.length > 100) undo.shift();
   redo = [];
@@ -125,6 +149,7 @@ function history(undoing) {
   const source = undoing ? undo : redo;
   const target = undoing ? redo : undo;
   if (!source.length) return;
+  invalidateMotion();
   target.push(clone(project));
   project = source.pop();
   pose = {};
@@ -135,9 +160,20 @@ function history(undoing) {
 }
 
 function load(data) {
+  invalidateMotion();
+  collisionGeometryKey = '';
   job = data;
   project = data.project;
   project.zero_pose ??= {};
+  project.collision_assembly_policy ??= 'exclude';
+  cameraVisible = false;
+  checkCollisions = true;
+  openPoseGroups = null;
+  try {
+    jointReviews = new Map(Object.entries(JSON.parse(localStorage.getItem('step2urdf.jointReviews.' + job.id) || '{}')));
+  } catch {
+    jointReviews = new Map();
+  }
   parts = data.parts;
   selection = { kind: 'links', id: project.links[0]?.id ?? null };
   treeTab = project.links.length ? 'links' : 'parts';
@@ -156,17 +192,136 @@ function load(data) {
   axisOptions = [];
   massProperties = {};
   localStorage.setItem('step2urdf.last', job.id);
+  const url = new URL(location.href);
+  if (url.searchParams.has('project') && url.searchParams.get('project') !== job.id) {
+    url.searchParams.set('project', job.id);
+    window.history.replaceState(null, '', url);
+  }
   viewer?.load(parts);
   $('#viewMessage').hidden = Boolean(viewer);
   if (dialog.open) dialog.close();
   render();
-  viewer?.fit();
+  setView('perspective');
+}
+
+function syncPoseView() {
+  viewer?.sync(project, {
+    kind: selection.kind, id: selection.id, parts: chosenParts, hidden, hiddenLinks,
+    pose: previewPose ?? pose, collisions, highlight: true,
+  });
 }
 
 function syncView() {
-  viewer?.sync(project, {
-    kind: selection.kind, id: selection.id, parts: chosenParts, hidden, hiddenLinks, pose, collisions, highlight: true,
+  syncPoseView();
+  if (collisions) refreshCollisionGeometry();
+}
+
+function schedulePoseView() {
+  if (poseFrame !== null) return;
+  poseFrame = requestAnimationFrame(() => {
+    poseFrame = null;
+    syncPoseView();
   });
+}
+
+async function refreshCollisionGeometry() {
+  const key = JSON.stringify([job.id, project.links.map(link => [link.id, link.parts, link.collision, link.origin, link.rpy]),
+    project.joints.map(joint => [joint.child, joint.anchor])]);
+  if (key === collisionGeometryKey) return;
+  collisionGeometryKey = key;
+  viewer?.setCollisionGeometry({});
+  try {
+    const result = await (await projectApi('collision-geometry')).json();
+    if (collisionGeometryKey !== key) return;
+    viewer?.setCollisionGeometry(result);
+    syncView();
+  } catch (error) {
+    if (collisionGeometryKey === key) toast('生成碰撞体失败：' + error.message, true);
+  }
+}
+
+function updatePoseControls() {
+  const previewing = previewPose !== null;
+  const status = $('#motionStatus');
+  if (status) status.textContent = !checkCollisions ? '仅运动学预览' : previewing ? '待碰撞确认' : '';
+  const displayedPose = previewPose ?? pose;
+  document.querySelectorAll('[data-pose]').forEach(slider => {
+    const number = slider.parentNode.querySelector('[data-pose-number]');
+    const value = displayedPose[slider.dataset.pose] ?? 0;
+    const rounded = Number(value.toFixed(6));
+    if (slider.valueAsNumber !== value) slider.value = value;
+    if (number.valueAsNumber !== rounded) number.value = rounded;
+    slider.disabled = configurationBusy;
+    number.disabled = configurationBusy;
+  });
+  for (const selector of ['#saveZeroPose', '#calculateLimits', '#clearZeroPose']) {
+    const button = $(selector);
+    if (button) button.disabled = configurationBusy || motionBusy || previewing;
+  }
+  const reset = $('#zeroPose');
+  if (reset) reset.disabled = configurationBusy;
+  const check = $('#checkMotionCollisions');
+  if (check) check.disabled = configurationBusy;
+  document.querySelectorAll('[data-nudge]').forEach(button => { button.disabled = configurationBusy || button.dataset.nudge === ''; });
+  document.querySelectorAll('[data-reverse-axis]').forEach(button => { button.disabled = configurationBusy || motionBusy || previewing; });
+}
+
+function requestMotion(target, defer = false) {
+  if (configurationBusy) return;
+  if (!checkCollisions) {
+    pose = { ...pose, ...target };
+    schedulePoseView();
+    updatePoseControls();
+    return;
+  }
+  const startingPreview = previewPose === null;
+  previewPose = { ...(previewPose ?? pose), ...target };
+  pendingMotion = null;
+  clearTimeout(motionTimer);
+  // A pause also commits keyboard input and drags that lose their change event.
+  motionTimer = setTimeout(checkMotionPreview, defer ? 160 : 0);
+  schedulePoseView();
+  if (startingPreview || !defer) updatePoseControls();
+}
+
+async function checkMotionPreview() {
+  if (motionTimer === null) return;
+  clearTimeout(motionTimer);
+  motionTimer = null;
+  pendingMotion = { target: previewPose, revision: motionRevision };
+  if (motionBusy) return;
+  motionBusy = true;
+  try {
+    while (pendingMotion) {
+      const request = pendingMotion;
+      pendingMotion = null;
+      const current = project;
+      try {
+        const start = absolutePose(current, pose);
+        const target = absolutePose(current, request.target);
+        const result = await (await projectApi('motion', { project: current, start, target })).json();
+        if (request.revision !== motionRevision) continue;
+        pose = relativePose(current, result.pose);
+        if (request.target !== previewPose) continue;
+        previewPose = null;
+        schedulePoseView();
+        if (result.blocked) {
+          const contact = result.contacts[0];
+          toast(contact ? (result.initial_collision ? '起始姿态已有碰撞：' : '已停在碰撞边界：') +
+            contact.first_name + ' / ' + contact.second_name : '已到达关节限位。', true);
+        }
+      } catch (error) {
+        if (request.revision === motionRevision && request.target === previewPose) {
+          previewPose = null;
+          schedulePoseView();
+          toast('试转检查失败：' + error.message, true);
+        }
+      }
+    }
+  } finally {
+    motionBusy = false;
+    updatePoseControls();
+  }
 }
 
 function render() {
@@ -179,7 +334,44 @@ function render() {
   for (const button of document.querySelectorAll('[data-step]')) button.classList.toggle('active', button.dataset.step === step);
   renderTree();
   renderInspector();
+  renderCameraPreview();
   syncView();
+}
+
+function renderCameraPreview() {
+  const camera = project.camera;
+  const shown = Boolean(viewer && camera && cameraVisible);
+  $('#showCamera').setAttribute('aria-pressed', String(shown));
+  $('#cameraPreview').hidden = !shown;
+  if (shown) {
+    $('#cameraScreen').style.setProperty('--camera-aspect', String(camera.width / camera.height));
+  }
+}
+
+function markView(view) {
+  document.querySelectorAll('[data-view]').forEach(button => {
+    button.setAttribute('aria-pressed', String(button.dataset.view === view));
+  });
+}
+
+function setView(view) {
+  if (!viewer) return;
+  viewer.resize();
+  viewer.fit(view);
+  if (view) markView(view);
+}
+
+function expandView(expanded) {
+  $('#viewport').classList.toggle('expanded-view', expanded);
+  document.querySelectorAll('.header, .workflow, .explorer, .inspector, .footer').forEach(panel => { panel.inert = expanded; });
+  const button = $('#expandView');
+  const label = expanded ? '退出全屏' : '全屏预览';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.setAttribute('aria-pressed', String(expanded));
+  button.innerHTML = icon(expanded ? 'minimize' : 'maximize');
+  paintIcons();
+  setView();
 }
 
 function treeDepth(id) {
@@ -200,7 +392,7 @@ function renderTree() {
   const query = $('#search').value.trim().toLocaleLowerCase();
   const entries = treeTab === 'parts' ? Object.values(parts) : project[treeTab];
   const tree = $('#tree');
-  const assignment = new Set(project.links.flatMap(link => link.parts));
+  const assignment = new Map(project.links.flatMap(link => link.parts.map(partId => [partId, link.name])));
   const matches = entries.filter(entry =>
     (treeTab !== 'parts' || !onlyUnassigned || !assignment.has(entry.id)) &&
     (entry.name + ' ' + (entry.path || []).join(' ')).toLocaleLowerCase().includes(query));
@@ -217,7 +409,7 @@ function renderTree() {
         (isPart && chosenParts.has(entry.id));
       const depth = isLink ? treeDepth(entry.id) : 0;
       const visibility = isPart ? hidden.has(entry.id) : hiddenLinks.has(entry.id);
-      const label = isPart ? (assignment.has(entry.id) ? '已分配' : '未分配') :
+      const label = isPart ? (assignment.get(entry.id) ?? '未分配') :
         isLink ? entry.parts.length + ' 件' : kindLabel[entry.type] || (entry.type === 'weld' ? '焊接' : '连接');
       const symbol = treeTab === 'joints' ? 'git-branch' : treeTab === 'loops' ? 'link-2' : 'box';
       const expand = isLink && entry.parts.length
@@ -227,7 +419,7 @@ function renderTree() {
       const row = '<div class="tree-row ' + (selected ? 'selected ' : '') + (visibility ? 'muted' : '') +
         '" style="--depth:' + depth + '">' + expand + '<button class="tree-select" data-select="' + key + '"><span class="tree-icon ' +
         (treeTab === 'joints' ? 'joint' : '') + '">' + icon(symbol) + '</span><span class="tree-name">' +
-        esc(entry.name) + '</span><span class="tree-tag">' + esc(label) + '</span></button>' +
+        esc(entry.name) + '</span><span class="tree-tag" title="' + esc(label) + '">' + esc(label) + '</span></button>' +
         (isPart || isLink ? '<button class="icon-button visibility" data-visibility="' + key + '" aria-label="' +
           (visibility ? '显示' : '隐藏') + esc(entry.name) + '">' + icon(visibility ? 'eye-off' : 'eye') + '</button>' : '') + '</div>';
       if (!isLink || !expanded.has(entry.id)) return row;
@@ -362,8 +554,10 @@ function renderInspector() {
     }
   }
   target.insertAdjacentHTML('beforeend', '<button class="button quiet wide model-settings" id="modelSettings">' +
-    icon('sliders-horizontal') + '模型基准与初始位姿</button>');
+    icon('sliders-horizontal') + '模型基准与初始位姿</button>' +
+    '<button class="button quiet wide" id="cameraSettings">' + icon('camera') + '摄像头设置</button>');
   $('#modelSettings').onclick = openSettings;
+  $('#cameraSettings').onclick = openCameraSettings;
   paintIcons();
 }
 
@@ -392,6 +586,9 @@ function bindFields(target, item, shouldChange = () => true) {
 function renderLink(target, link) {
   const physical = massProperties[link.id];
   const incoming = project.joints.find(joint => joint.child === link.id);
+  const sensors = [];
+  if (project.camera?.parent === link.id) sensors.push('摄像头');
+  if (project.imu?.parent === link.id) sensors.push('IMU');
   const automatic = physical ? physical.mass.toFixed(4) + ' kg' : '按密度计算';
   const inertia = physical
     ? '<div class="readout"><div><span>质心 (m)</span><strong>' + physical.center.map(x => x.toFixed(4)).join(', ') +
@@ -399,10 +596,11 @@ function renderLink(target, link) {
     : '';
   target.innerHTML = heading('LINK', link.name, 'link') + '<div class="stats">' +
     stat('关联零件', link.parts.length) + stat('父关节', incoming ? esc(incoming.name) : '根 Link') + '</div>' +
+    (sensors.length ? '<p class="subtle">传感器 ' + sensors.join('、') + '</p>' : '') +
     '<section class="inspector-section"><h4>坐标与外观</h4>' + field('名称', 'name', link.name) +
     (incoming ? '<p class="subtle">Link 原点取自父关节的锚点。</p>' : vectors('原点 (m)', 'origin', link.origin)) +
     vectors('朝向 RPY (rad)', 'rpy', link.rpy) +
-    select('碰撞体', 'collision', link.collision, [['mesh', '网格'], ['box', '包围盒'], ['none', '禁用']]) + '</section>' +
+    select('碰撞体', 'collision', link.collision, [['convex', '凸分解（推荐）'], ['mesh', '网格（凸包检测）'], ['box', '包围盒'], ['none', '禁用']]) + '</section>' +
     '<section class="inspector-section"><h4>质量与惯量</h4>' + field('密度 (kg/m³)', 'density', link.density, 'number') +
     '<div class="readout"><div><span>质量</span><strong>' + (link.mass != null ? link.mass + ' kg' : automatic) +
     '</strong></div></div>' + inertia + '<div class="inline-actions"><button id="computeMass" class="button secondary">计算</button>' +
@@ -422,6 +620,8 @@ function renderLink(target, link) {
   $('#editMass').onclick = () => openMass(link, physical);
   $('#deleteSelected').onclick = () => edit(() => {
     project.links = project.links.filter(entry => entry !== link);
+    if (project.camera?.parent === link.id) project.camera = null;
+    if (project.imu?.parent === link.id) project.imu = null;
     const removed = project.joints.filter(entry => entry.child === link.id || entry.parent === link.id).map(entry => entry.id);
     project.joints = project.joints.filter(entry => !removed.includes(entry.id));
     project.joints.forEach(entry => { if (removed.includes(entry.mimic?.joint)) entry.mimic = null; });
@@ -533,45 +733,218 @@ function renderLoop(target, loop) {
   });
 }
 
+function reviewSignature(joint) {
+  const attached = [joint.parent, joint.child].map(id => project.links.find(link => link.id === id));
+  return JSON.stringify([joint.parent, joint.child, joint.type, joint.anchor, joint.axis, joint.lower, joint.upper,
+    project.zero_pose[joint.id] ?? 0, project.world_rpy, attached.map(link => [link?.origin, link?.rpy, link?.parts])]);
+}
+
+function jointIsReviewed(joint) {
+  return jointReviews.get(joint.id) === reviewSignature(joint);
+}
+
+function selectReviewJoint(id) {
+  if (selection.kind === 'joints' && selection.id === id) return;
+  selection = { kind: 'joints', id };
+  axisOptions = [];
+  for (const button of document.querySelectorAll('[data-review-joint]')) {
+    const selected = button.dataset.reviewJoint === id;
+    button.setAttribute('aria-expanded', String(selected));
+    button.nextElementSibling.hidden = !selected;
+  }
+  if (treeTab === 'joints') renderTree();
+  schedulePoseView();
+}
+
+function poseRow(joint, index, linkNames) {
+  const [lower, upper] = poseRange(joint, project.zero_pose);
+  const value = (previewPose ?? pose)[joint.id] ?? 0;
+  const limits = ' min="' + lower + '" max="' + upper + '" step="any"';
+  const linear = joint.type === 'prismatic';
+  const step = linear ? 0.002 : Math.PI / 18;
+  const negative = Math.min(upper, Math.max(lower, -step));
+  const positive = Math.min(upper, Math.max(lower, step));
+  const selected = selection.kind === 'joints' && selection.id === joint.id;
+  const name = esc(joint.name);
+  return '<article class="pose-row"><button class="pose-select" data-review-joint="' + esc(joint.id) +
+    '" aria-controls="pose-detail-' + index + '" aria-expanded="' + selected + '"><strong>' + name + '</strong>' +
+    '<span class="pose-review-mark"></span></button><div class="pose-detail" id="pose-detail-' + index + '"' + (selected ? '' : ' hidden') + '>' +
+    '<dl class="pose-joint-links"><div><dt>父 Link</dt><dd>' + esc(linkNames.get(joint.parent)) +
+    '</dd></div><div><dt>子 Link</dt><dd>' + esc(linkNames.get(joint.child)) + '</dd></div></dl>' +
+    '<div class="pose-value"><span>相对零位</span><label class="pose-number"><input aria-label="' + name +
+    ' 数值" type="number" data-pose-number' + limits + ' value="' + Number(value.toFixed(6)) + '"><span>' +
+    (linear ? 'm' : 'rad') + '</span></label></div><input aria-label="' + name + '" type="range"' + limits +
+    ' value="' + value + '" data-pose="' + esc(joint.id) + '"><div class="pose-nudge">' +
+    '<button class="button secondary" data-nudge="' + (negative < 0 ? negative : '') + '">负向试转</button>' +
+    '<button class="button secondary" data-nudge="' + (positive > 0 ? positive : '') + '">正向试转</button>' +
+    (joint.type !== 'ball' ? '<button class="button secondary" data-reverse-axis>反转轴向</button>' : '') + '</div>' +
+    '<label class="check-row"><input type="checkbox" data-confirm-joint>已确认</label></div></article>';
+}
+
 function renderPose(target) {
   const joints = project.joints.filter(joint => joint.type !== 'fixed' && !joint.mimic);
+  const auxiliary = project.joints.filter(joint => joint.type === 'fixed' || joint.mimic);
+  const linkNames = new Map(project.links.map(link => [link.id, link.name]));
+  const jointById = new Map(joints.map(joint => [joint.id, joint]));
+  const groups = new Map(['头部', '左臂', '右臂', '左腿', '右腿', '其他关节'].map(name => [name, []]));
+  for (const joint of joints) groups.get(jointReviewGroup(joint)).push(joint);
+  const activeGroup = selection.kind === 'joints' && jointById.has(selection.id) ? jointReviewGroup(jointById.get(selection.id)) : null;
+  openPoseGroups ??= new Set([activeGroup ?? [...groups].find(([, rows]) => rows.length)?.[0]]);
+  if (activeGroup) openPoseGroups.add(activeGroup);
   const customized = Object.keys(project.zero_pose).length > 0;
-  target.innerHTML = heading('运动预览', '关节试转', 'joint') +
-    '<p class="subtle">试转数值相对于当前零位。将姿态设为零位后，导出的模型也会以该姿态为 0。</p>' +
-    (joints.length ? '<div class="zero-controls"><div class="zero-label">当前基准：' + (customized ? '自定义零位' : 'CAD 零位') +
-      '</div><button class="button primary wide" id="saveZeroPose">' + icon('check') + '将当前姿态设为零位</button>' +
-      '<div class="inline-actions"><button class="button secondary" id="zeroPose">' + icon('rotate-ccw') + '回到零位</button>' +
+  let rowIndex = 0;
+  const groupRows = [...groups].filter(([, group]) => group.length).map(([label, group]) =>
+    '<details class="pose-group" data-pose-group="' + label + '"' + (openPoseGroups.has(label) ? ' open' : '') +
+    '><summary>' + label + '<span class="pose-group-count"></span></summary>' +
+    group.map(joint => poseRow(joint, rowIndex++, linkNames)).join('') + '</details>').join('');
+  target.innerHTML = heading('运动预览', '关节复核', 'joint') +
+    (joints.length ? '<div class="zero-controls"><div class="zero-label"><span>当前基准：' + (customized ? '自定义零位' : 'CAD 零位') +
+      '</span><span id="motionStatus" role="status"></span></div><div class="inline-actions">' +
+      '<button class="button secondary" id="zeroPose">' + icon('rotate-ccw') + '回到零位</button>' +
+      '<button class="button secondary" id="saveZeroPose">' + icon('check') + '将当前姿态设为零位</button>' +
       (customized ? '<button class="text-button" id="clearZeroPose">恢复 CAD 零位</button>' : '') + '</div></div>' : '') +
-    (joints.length ? '<div class="pose-list">' + joints.map(joint => {
-      const zero = project.zero_pose[joint.id] ?? 0;
-      const bounded = joint.type === 'revolute' || joint.type === 'prismatic';
-      const lower = bounded ? Math.min(joint.lower - zero, 0) : -Math.PI;
-      const upper = bounded ? Math.max(joint.upper - zero, 0) : Math.PI;
-      const value = Math.max(lower, Math.min(upper, pose[joint.id] ?? 0));
-      const limits = ' min="' + lower + '" max="' + upper + '" step="any"';
-      const unit = joint.type === 'prismatic' ? 'm' : 'rad';
-      return '<div class="pose-row"><span><strong>' + esc(joint.name) + '</strong><label class="pose-number">' +
-        '<input aria-label="' + esc(joint.name) + ' 数值" type="number" data-pose-number' + limits +
-        ' value="' + Number(value.toFixed(6)) + '"><span>' + unit + '</span></label></span><input aria-label="' +
-        esc(joint.name) + '" type="range"' + limits + ' value="' + value + '" data-pose="' + esc(joint.id) + '"></div>';
-    }).join('') + '</div>' :
-    '<div class="empty-tree">配置运动关节后即可试转。</div>');
+    (joints.length ? '<label class="check-row"><input id="checkMotionCollisions" type="checkbox"' + (checkCollisions ? ' checked' : '') +
+      '>试转时检查碰撞</label><div id="reviewProgress" class="pose-review-progress" aria-live="polite"></div>' :
+      '<div class="empty-tree">配置运动关节后即可试转。</div>') +
+    '<div class="pose-list">' + groupRows + (auxiliary.length ? '<details class="pose-group"><summary>固定与随动关节' +
+      '<span class="pose-group-count">' + auxiliary.length + '</span></summary><ul class="pose-aux">' +
+      auxiliary.map(joint => '<li>' + esc(joint.name) + ' · ' + (joint.type === 'fixed' ? '固定' : '随动') + '</li>').join('') +
+      '</ul></details>' : '') + '</div>' +
+    '<details class="inspector-section motion-settings"><summary>碰撞与行程设置</summary>' +
+    '<p class="subtle">开启检查后，松开滑杆时验证运动路径，有碰撞会停在首次接触边界。计算限位会更新关节行程。</p>' +
+    '<button class="button secondary wide" id="generateCollisions">为所有 Link 生成碰撞体</button>' +
+    '<button class="button secondary wide" id="calculateLimits">按碰撞体计算限位</button>' +
+    select('CAD 装配重叠', 'assemblyPolicy', project.collision_assembly_policy ?? 'exclude',
+      [['exclude', '排除已重叠的相邻凸体对'], ['strict', '严格限制重叠深度']]) +
+    '<p class="subtle">计算时其他关节保持零位。旋转向两侧各扫描 360°，滑动各 0.5 m。机械、电缆限位请在关节属性中设置。</p></details>';
+
+  const renderProgress = () => {
+    const progress = $('#reviewProgress');
+    if (!progress) return;
+    progress.innerHTML = '<strong>已确认 ' + joints.filter(jointIsReviewed).length + ' / ' + joints.length + '</strong> 个运动关节';
+    for (const list of target.querySelectorAll('[data-pose-group]')) {
+      const group = groups.get(list.dataset.poseGroup);
+      list.querySelector('.pose-group-count').textContent = group.filter(jointIsReviewed).length + ' / ' + group.length;
+      for (const button of list.querySelectorAll('[data-review-joint]')) {
+        const reviewed = jointIsReviewed(jointById.get(button.dataset.reviewJoint));
+        button.querySelector('.pose-review-mark').textContent = reviewed ? '已确认' : '';
+        button.nextElementSibling.querySelector('[data-confirm-joint]').checked = reviewed;
+      }
+    }
+  };
+  renderProgress();
+  updatePoseControls();
+  $('#checkMotionCollisions')?.addEventListener('change', event => {
+    invalidateMotion();
+    checkCollisions = event.currentTarget.checked;
+    pose = {};
+    schedulePoseView();
+    updatePoseControls();
+  });
+  for (const list of target.querySelectorAll('[data-pose-group]')) list.ontoggle = () => {
+    if (!list.isConnected) return;
+    if (list.open) openPoseGroups.add(list.dataset.poseGroup);
+    else openPoseGroups.delete(list.dataset.poseGroup);
+  };
+  for (const button of target.querySelectorAll('[data-review-joint]')) {
+    const joint = jointById.get(button.dataset.reviewJoint);
+    const detail = button.nextElementSibling;
+    button.onclick = () => {
+      if (button.getAttribute('aria-expanded') === 'true') {
+        button.setAttribute('aria-expanded', 'false');
+        detail.hidden = true;
+      } else {
+        selectReviewJoint(joint.id);
+        button.setAttribute('aria-expanded', 'true');
+        detail.hidden = false;
+      }
+    };
+    detail.querySelector('[data-confirm-joint]').onchange = event => {
+      if (event.currentTarget.checked) jointReviews.set(joint.id, reviewSignature(joint));
+      else jointReviews.delete(joint.id);
+      try {
+        localStorage.setItem('step2urdf.jointReviews.' + job.id, JSON.stringify(Object.fromEntries(jointReviews)));
+      } catch { toast('此浏览器无法保存关节复核记录。', true); }
+      renderProgress();
+    };
+    for (const nudge of detail.querySelectorAll('[data-nudge]')) nudge.onclick = () => {
+      requestMotion({ [joint.id]: Number(nudge.dataset.nudge) });
+    };
+    detail.querySelector('[data-reverse-axis]')?.addEventListener('click', () => {
+      edit(() => reverseJointDirection(project, joint, pose));
+      toast('已反转轴向，当前姿态和实际行程保持一致。');
+    });
+  }
   target.querySelectorAll('[data-pose]').forEach(slider => {
     const number = slider.parentNode.querySelector('[data-pose-number]');
-    const show = () => {
-      pose[slider.dataset.pose] = slider.valueAsNumber;
-      number.value = Number(slider.valueAsNumber.toFixed(6));
-      selection = { kind: 'joints', id: slider.dataset.pose };
-      syncView();
+    const show = defer => {
+      const value = slider.valueAsNumber;
+      number.value = Number(value.toFixed(6));
+      requestMotion({ [slider.dataset.pose]: value }, defer);
     };
-    slider.oninput = show;
+    slider.oninput = () => show(true);
+    slider.onchange = checkMotionPreview;
     number.onchange = () => {
       if (Number.isFinite(number.valueAsNumber)) slider.value = number.value;
-      show();
+      show(false);
     };
   });
+  $('#generateCollisions').onclick = () => {
+    edit(() => { project.links.forEach(link => { link.collision = 'convex'; }); });
+    collisions = true;
+    $('#showCollisions').setAttribute('aria-pressed', 'true');
+    syncView();
+    toast('已启用凸分解碰撞体，首次生成可能需要一些时间。');
+  };
+  target.querySelector('[data-field="assemblyPolicy"]').onchange = event => {
+    const policy = event.currentTarget.value;
+    edit(() => { project.collision_assembly_policy = policy; });
+  };
+  $('#calculateLimits').onclick = async event => {
+    if (motionBusy) return;
+    const current = project;
+    const revision = motionRevision;
+    const button = event.currentTarget;
+    const candidates = joints.filter(joint => ['revolute', 'continuous', 'prismatic'].includes(joint.type));
+    if (!candidates.length) return toast('请先配置独立的旋转或滑动关节。', true);
+    motionBusy = true;
+    configurationBusy = true;
+    updatePoseControls();
+    const results = [];
+    try {
+      for (const joint of candidates) {
+        button.textContent = '计算中：' + joint.name + ' (' + (results.length + 1) + '/' + candidates.length + ')';
+        const result = await (await projectApi('collision-limits', {
+          project: current, pose: absolutePose(current), joint: joint.id,
+        })).json();
+        if (revision !== motionRevision) return;
+        if (result.upper - result.lower < 1e-6) throw new Error(joint.name + ' 没有可用行程，请检查碰撞体和转轴。');
+        results.push(result);
+      }
+      edit(() => {
+        for (const result of results) {
+          const joint = project.joints.find(item => item.id === result.joint);
+          if (joint.type === 'continuous' && !result.unrestricted) joint.type = 'revolute';
+          joint.lower = result.lower;
+          joint.upper = result.upper;
+        }
+        pose = {};
+      });
+      const contacts = Math.max(...results.map(result => result.excluded_contacts));
+      toast('已更新 ' + results.length + ' 个关节的碰撞限位。' +
+        (contacts ? '已排除 ' + contacts + ' 对 CAD 相邻装配重叠。' : ''));
+    } catch (error) { toast('限位计算失败：' + error.message, true); }
+    finally {
+      motionBusy = false;
+      configurationBusy = false;
+      button.textContent = '按碰撞体计算限位';
+      pendingMotion = null;
+      updatePoseControls();
+    }
+  };
   $('#zeroPose')?.addEventListener('click', resetPose);
   $('#saveZeroPose')?.addEventListener('click', async event => {
+    if (motionBusy) return;
     const reference = Object.fromEntries(joints.map(joint =>
       [joint.id, (project.zero_pose[joint.id] ?? 0) + (pose[joint.id] ?? 0)]));
     const byId = new Map(project.joints.map(joint => [joint.id, joint]));
@@ -583,25 +956,56 @@ function renderPose(target) {
         return;
       }
     }
-    if (project.loops.length) {
+    {
       const current = project;
       const button = event.currentTarget;
+      const revision = motionRevision;
+      motionBusy = true;
+      configurationBusy = true;
+      updatePoseControls();
       button.disabled = true;
       try {
         const result = await (await projectApi('validate', { project: { ...current, zero_pose: reference }, formats: [] })).json();
-        if (project !== current || !button.isConnected) return;
+        if (project !== current || revision !== motionRevision || !button.isConnected) return;
         if (result.errors.length) throw new Error(result.errors.join(' '));
+        const checked = await (await projectApi('motion', { project: current, start: reference, target: reference })).json();
+        if (project !== current || revision !== motionRevision || !button.isConnected) return;
+        if (checked.blocked) throw new Error('当前姿态存在碰撞，不能设为零位。');
       } catch (error) {
         toast(error.message, true);
         return;
-      } finally { button.disabled = false; }
+      } finally {
+        motionBusy = false;
+        configurationBusy = false;
+        pendingMotion = null;
+        updatePoseControls();
+      }
     }
     edit(() => { project.zero_pose = reference; pose = {}; });
     toast('当前姿态已设为零位。');
   });
-  $('#clearZeroPose')?.addEventListener('click', () => {
-    edit(() => { project.zero_pose = {}; pose = {}; });
-    toast('已恢复 CAD 零位。');
+  $('#clearZeroPose')?.addEventListener('click', async () => {
+    if (motionBusy) return;
+    const current = project;
+    const revision = motionRevision;
+    const reference = Object.fromEntries(joints.map(joint => [joint.id, 0]));
+    motionBusy = true;
+    configurationBusy = true;
+    updatePoseControls();
+    try {
+      const result = await (await projectApi('motion', { project: current, start: reference, target: reference })).json();
+      if (current !== project || revision !== motionRevision) return;
+      if (result.blocked) throw new Error('CAD 原始姿态存在碰撞。');
+      edit(() => { project.zero_pose = {}; pose = {}; });
+      toast('已恢复 CAD 零位。');
+    } catch (error) {
+      if (revision === motionRevision) toast('无法恢复 CAD 零位，已保留当前零位：' + error.message, true);
+    } finally {
+      motionBusy = false;
+      configurationBusy = false;
+      pendingMotion = null;
+      updatePoseControls();
+    }
   });
 }
 
@@ -681,6 +1085,41 @@ function nameOf(value) {
   return name;
 }
 
+function openCameraSettings() {
+  if (!project?.links.length) {
+    toast('创建安装 Link 后即可添加摄像头。', true);
+    return;
+  }
+  const camera = project.camera ?? {
+    parent: selection.kind === 'links' && selectedObject() ? selection.id : project.links[0].id,
+    origin: zero, rpy: zero, width: 1920, height: 1080, horizontal_fov: 70 * Math.PI / 180,
+    fps: 30, near: 0.005, far: 20,
+  };
+  formDialog('摄像头设置', select('安装 Link', 'parent', camera.parent, linkOptions()) +
+    '<p class="subtle">相对于安装 Link。相机沿 +X 拍摄，+Z 朝上。</p>' +
+    vectors('安装位置 (m)', 'origin', camera.origin) + vectors('安装朝向 RPY (rad)', 'rpy', camera.rpy) +
+    field('水平视场 (°)', 'fov_degrees', Number((camera.horizontal_fov * 180 / Math.PI).toPrecision(10)), 'number') +
+    field('宽度 (px)', 'width', camera.width, 'number') + field('高度 (px)', 'height', camera.height, 'number') +
+    field('更新频率 (Hz)', 'fps', camera.fps, 'number') + field('近裁剪 (m)', 'near', camera.near, 'number') +
+    field('远裁剪 (m)', 'far', camera.far, 'number'), '保存', ({ fov_degrees, ...values }) => {
+    if (![...values.origin, ...values.rpy, fov_degrees, values.fps, values.near, values.far].every(Number.isFinite) ||
+        ![values.width, values.height].every(size => Number.isInteger(size) && size >= 1 && size <= 8192) ||
+        !(fov_degrees > 0 && fov_degrees < 180 && values.fps > 0 && values.near > 0 && values.far > values.near)) {
+      throw new Error('请填写有限的数值。分辨率为 1–8192 像素，视场在 0° 与 180° 之间，频率及近裁剪为正数，远裁剪大于近裁剪。');
+    }
+    cameraVisible = true;
+    edit(() => { project.camera = { ...values, horizontal_fov: fov_degrees * Math.PI / 180 }; });
+  });
+  if (project.camera) {
+    dialog.querySelector('.dialog-actions').insertAdjacentHTML('afterbegin',
+      '<button id="removeCamera" type="button" class="button quiet danger">移除摄像头</button>');
+    $('#removeCamera').onclick = () => {
+      edit(() => { project.camera = null; });
+      dialog.close();
+    };
+  }
+}
+
 function uniqueName(base, entries) {
   const names = new Set(entries.map(item => item.name));
   let name = base;
@@ -691,7 +1130,7 @@ function uniqueName(base, entries) {
 
 function createLink(name, ids, origin) {
   const link = { id: id(), name: uniqueName(nameOf(name), project.links), parts: ids, origin,
-    rpy: [...zero], density: 1000, mass: null, center: null, inertia: null, collision: 'mesh' };
+    rpy: [...zero], density: 1000, mass: null, center: null, inertia: null, collision: 'convex' };
   edit(() => {
     for (const existing of project.links) existing.parts = existing.parts.filter(key => !ids.includes(key));
     project.links.push(link);
@@ -992,9 +1431,11 @@ async function downloadExport(training = null) {
 }
 
 function resetPose() {
+  if (configurationBusy) return;
+  invalidateMotion();
   pose = {};
-  renderInspector();
-  syncView();
+  schedulePoseView();
+  updatePoseControls();
 }
 
 for (const button of document.querySelectorAll('[data-step]')) button.onclick = () => {
@@ -1017,9 +1458,22 @@ $('#openExport').onclick = openExport;
 $('#saveProject').onclick = saveProject;
 $('#undo').onclick = () => history(true);
 $('#redo').onclick = () => history(false);
-$('#fit').onclick = () => viewer?.fit();
-$('#topView').onclick = () => viewer?.fit(true);
+$('#fit').onclick = () => setView();
+for (const button of document.querySelectorAll('[data-view]')) button.onclick = () => setView(button.dataset.view);
+$('#expandView').onclick = () => expandView(!$('#viewport').classList.contains('expanded-view'));
 $('#resetPose').onclick = () => { if (project) resetPose(); };
+$('#previewCameraSettings').onclick = openCameraSettings;
+$('#hideCamera').onclick = () => {
+  cameraVisible = false;
+  renderCameraPreview();
+  $('#showCamera').focus();
+};
+$('#showCamera').onclick = () => {
+  if (!project?.camera) return openCameraSettings();
+  if (!viewer) return toast('此设备无法初始化 WebGL，无法显示摄像头画面。', true);
+  cameraVisible = !cameraVisible;
+  renderCameraPreview();
+};
 $('#showCollisions').onclick = event => {
   if (!project) return;
   collisions = !collisions;
@@ -1037,12 +1491,17 @@ for (const input of [$('#modelInput'), $('#folderInput')]) input.onchange = () =
   importFiles(files);
 };
 document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && !dialog.open && $('#viewport').classList.contains('expanded-view')) {
+    expandView(false);
+    $('#expandView').focus();
+    return;
+  }
   if (!project || dialog.open || !(event.ctrlKey || event.metaKey) || /INPUT|TEXTAREA|SELECT/.test(event.target.tagName)) return;
   const key = event.key.toLowerCase();
   if (key === 'z' || key === 'y') { event.preventDefault(); history(key === 'z' && !event.shiftKey); }
 });
 paintIcons();
-const previous = localStorage.getItem('step2urdf.last');
+const previous = new URLSearchParams(location.search).get('project') ?? localStorage.getItem('step2urdf.last');
 try {
   if (!previous) await loadDemo('arm');
   else load(await (await api('/projects/' + previous)).json());
