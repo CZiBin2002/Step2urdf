@@ -1,7 +1,7 @@
 import {
   ArrowDownToLine, ArrowRight, Box, Check, ChevronDown, CircleHelp, CloudUpload,
   Download, Eye, EyeOff, FileCode, Folder, FolderOpen, GitBranch, Layers3, Link2,
-  Maximize, Mouse, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
+  Maximize, Mouse, Plug, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
   Sparkles, Trash2, Undo2, X, createIcons,
 } from 'lucide';
 
@@ -12,14 +12,22 @@ const icon = name => '<i data-lucide="' + name + '"></i>';
 const icons = {
   ArrowDownToLine, ArrowRight, Box, Check, ChevronDown, CircleHelp, CloudUpload,
   Download, Eye, EyeOff, FileCode, Folder, FolderOpen, GitBranch, Layers3, Link2,
-  Maximize, Mouse, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
+  Maximize, Mouse, Plug, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
   Sparkles, Trash2, Undo2, X,
 };
 const paintIcons = () => createIcons({ icons, attrs: { 'stroke-width': 1.65 } });
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 const clone = value => structuredClone(value);
-const id = () => crypto.randomUUID().slice(0, 12);
+function randomUUID() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+}
+const id = () => randomUUID().slice(0, 12);
 const zero = [0, 0, 0];
 const unitZ = [0, 0, 1];
 const kindLabel = { fixed: '固定', revolute: '旋转', continuous: '连续旋转', prismatic: '滑动', ball: '球铰' };
@@ -53,7 +61,7 @@ let saveRequest = Promise.resolve();
 let exportOptions = { formats: ['urdf'], merge: false, simplify_urdf: false, training: 'isaac' };
 
 const dialog = $('#dialog');
-const clientId = crypto.randomUUID();
+const clientId = randomUUID();
 const localJobs = new Set();
 let remoteChain = Promise.resolve();
 let remoteActive = false;
@@ -1078,6 +1086,51 @@ for (const button of document.querySelectorAll('[data-inspect]')) button.onclick
 $('#search').oninput = () => { if (project) renderTree(); };
 $('#importButton').onclick = openImport;
 $('#openExport').onclick = openExport;
+function mcpInstructions() {
+  const endpoint = location.protocol + '//' + location.hostname + ':18766/mcp';
+  const upload = location.protocol + '//' + location.host + '/api/import';
+  const skill = location.origin + '/skill/step2urdf-upload.zip';
+  return '请在当前客户端接入这个 MCP 服务，不要设置 Token。\n\n' +
+    '名称：step2urdf\n传输：Streamable HTTP\n地址：' + endpoint + '\n\n' +
+    '配置：\n{\n  "mcpServers": {\n    "step2urdf": {\n      "type": "http",\n      "url": "' + endpoint + '"\n    }\n  }\n}\n\n' +
+    '同时下载上传技能，解压到当前 AI 客户端的 skills 目录：\n' + skill + '\n' +
+    '解压后的文件夹名保持 step2urdf-upload。这是通用 Agent Skill，不限定某一种编辑器。' +
+    '本地 STP 由这个技能上传到 ' + upload + '，字段名 files。';
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* 局域网 HTTP 页面通常不允许剪贴板接口。 */ }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.left = '-9999px';
+  document.body.append(area);
+  area.select();
+  const copied = document.execCommand('copy');
+  area.remove();
+  return copied;
+}
+
+function openMcpAccess() {
+  const text = mcpInstructions();
+  const skill = location.origin + '/skill/step2urdf-upload.zip';
+  modal('MCP 接入', '<div class="dialog-body"><p class="subtle">把下面的内容复制给 AI，配置 MCP。上传技能是通用 Agent Skill，解压到所用客户端的 skills 目录，文件夹名保持 step2urdf-upload。</p>' +
+    '<textarea id="mcpText" class="mcp-copy" readonly>' + esc(text) + '</textarea>' +
+    '<div class="dialog-actions"><a class="button secondary" href="' + esc(skill) + '" download>下载上传技能</a>' +
+    '<button id="copyMcp" type="button" class="button primary">复制给 AI</button></div></div>');
+  $('#copyMcp').onclick = async () => {
+    const copied = await copyText($('#mcpText').value);
+    toast(copied ? '已复制，粘贴给 AI 即可。' : '复制失败，请在文本框里手动选择复制。', !copied);
+  };
+}
+
+$('#mcpAccess').onclick = openMcpAccess;
 $('#saveProject').onclick = saveProject;
 $('#undo').onclick = () => history(true);
 $('#redo').onclick = () => history(false);

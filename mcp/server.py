@@ -40,10 +40,8 @@ client = httpx.AsyncClient(base_url=WORKBENCH_URL, timeout=httpx.Timeout(600.0, 
 mcp = FastMCP(
     "step2urdf",
     instructions=(
-        "Step2URDF：把 STEP 装配转成 URDF/MJCF/USD。典型流程："
-        "import_model(或 create_demo) → get_structure 观察零件 → create_link 分组刚体 → "
-        "suggest_axes/create_joint 配关节 → compute_mass → validate → export_model 导出。"
-        "长度单位米，角度单位弧度（30°≈0.524）。"
+        "Step2URDF：按用户的具体要求操作当前工程。长度单位米，角度单位弧度（30°≈0.524）。"
+        "工作台页面已打开，修改会直接显示出来。"
     ),
 )
 

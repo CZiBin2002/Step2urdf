@@ -358,5 +358,27 @@ def export(job: str, request: ExportRequest):
                     headers={"Content-Disposition": f'attachment; filename="{name}{suffix}.zip"'})
 
 
+def skill_directory():
+    packaged = ROOT / "skill" / "step2urdf-upload"
+    if (packaged / "SKILL.md").is_file():
+        return packaged
+    checkout = ROOT / ".cursor" / "skills" / "step2urdf-upload"
+    if (checkout / "SKILL.md").is_file():
+        return checkout
+    raise HTTPException(404, "上传技能包不存在。")
+
+
+@app.get("/skill/step2urdf-upload.zip")
+def download_skill():
+    directory = skill_directory()
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        for path in directory.rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts:
+                archive.write(path, Path("step2urdf-upload") / path.relative_to(directory))
+    return Response(buffer.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="step2urdf-upload.zip"'})
+
+
 if (ROOT / "dist").is_dir():
     app.mount("/", StaticFiles(directory=ROOT / "dist", html=True), name="workbench")

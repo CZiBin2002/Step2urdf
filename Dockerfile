@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgl1 libglu1-mesa libxext6 libx11-6 \
     && rm -rf /var/lib/apt/lists/*
 COPY workbench ./workbench
+COPY .cursor/skills/step2urdf-upload ./skill/step2urdf-upload
 COPY --from=frontend /src/dist ./dist
 EXPOSE 18765
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
