@@ -49,8 +49,8 @@ copy /y "package-lock.json" "node_modules\.step2urdf-package-lock.json" >nul || 
 echo Building the frontend...
 call npm.cmd run build || goto failed
 
-echo Open http://127.0.0.1:8765/ after the server starts. Press Ctrl+C to stop it.
-"%VENV_PYTHON%" -m uvicorn workbench.server:app --host 127.0.0.1 --port 8765 || goto failed
+echo Open http://127.0.0.1:18765/ after the server starts. Press Ctrl+C to stop it.
+"%VENV_PYTHON%" -m uvicorn workbench.server:app --host 127.0.0.1 --port 18765 || goto failed
 popd
 exit /b 0
 

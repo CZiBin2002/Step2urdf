@@ -6,6 +6,35 @@ function transform(position, rotation) {
   return matrix.setPosition(new THREE.Vector3(...position));
 }
 
+const roundPose = value => Math.round(value * 1e9) / 1e9;
+
+function poseFrom(rotation, origin) {
+  const euler = new THREE.Euler().setFromRotationMatrix(rotation, 'ZYX');
+  return {
+    world_origin: origin.toArray().map(roundPose),
+    world_rpy: [euler.x, euler.y, euler.z].map(roundPose),
+  };
+}
+
+/** Rotate the whole model about its CAD center so a 90° correction stays in view. */
+export function composeWorldPose(origin, rpy, center, axisIndex, quarterTurns) {
+  const current = transform(origin, rpy);
+  const axis = new THREE.Vector3().setComponent(axisIndex, 1);
+  const delta = new THREE.Matrix4().makeRotationAxis(axis, quarterTurns * Math.PI / 2);
+  const rotation = new THREE.Matrix4().extractRotation(current);
+  const nextRotation = delta.multiply(rotation);
+  const pivot = new THREE.Vector3(...center);
+  const pivotWorld = pivot.clone().applyMatrix4(current);
+  const nextOrigin = pivotWorld.sub(pivot.applyMatrix4(nextRotation));
+  return poseFrom(nextRotation, nextOrigin);
+}
+
+export function resetWorldRotation(origin, rpy, center) {
+  const pivot = new THREE.Vector3(...center);
+  const pivotWorld = pivot.clone().applyMatrix4(transform(origin, rpy));
+  return poseFrom(new THREE.Matrix4(), pivotWorld.sub(pivot));
+}
+
 export function jointCoordinate(joint, joints, reference, motion = {}, seen = new Set()) {
   if (!joint || seen.has(joint.id) || joint.type === 'fixed') return 0;
   if (!joint.mimic) return (reference[joint.id] ?? 0) + (motion[joint.id] ?? 0);

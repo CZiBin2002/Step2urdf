@@ -1,18 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import tempfile
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from threading import Lock
 from typing import Literal
 from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import Response
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
@@ -26,7 +28,103 @@ ROOT = Path(__file__).resolve().parent.parent
 CACHE = Path(os.environ.get("STEP2URDF_PROJECTS", ROOT / ".projects"))
 UPLOAD_LIMIT = 200 * 1024 * 1024
 FILE_LIMIT = 4096
+LOOP: asyncio.AbstractEventLoop | None = None
+LISTENERS: list[asyncio.Queue] = []
+LISTENER_LOCK = Lock()
 app = FastAPI(title="Step2URDF API")
+
+
+@app.on_event("startup")
+async def remember_event_loop():
+    global LOOP
+    LOOP = asyncio.get_running_loop()
+
+
+def publish(event: dict):
+    if LOOP is None:
+        return
+    with LISTENER_LOCK:
+        queues = list(LISTENERS)
+    for queue in queues:
+        LOOP.call_soon_threadsafe(queue.put_nowait, event)
+
+
+def item_names(items):
+    return "、".join(item.get("name") or item["id"] for item in items)
+
+
+def describe_project_change(before: dict, after: dict):
+    messages = []
+    focus = None
+    old_links = {item["id"]: item for item in before.get("links", [])}
+    new_links = {item["id"]: item for item in after.get("links", [])}
+    added_links = [item for key, item in new_links.items() if key not in old_links]
+    removed_links = [item for key, item in old_links.items() if key not in new_links]
+    updated_links = [new_links[key] for key in old_links.keys() & new_links.keys() if old_links[key] != new_links[key]]
+    if added_links:
+        messages.append("新增 Link " + item_names(added_links))
+        focus = {"kind": "links", "id": added_links[-1]["id"]}
+    if removed_links:
+        messages.append("移除 Link " + item_names(removed_links))
+    if updated_links:
+        messages.append("更新 Link " + item_names(updated_links))
+        focus = focus or {"kind": "links", "id": updated_links[-1]["id"]}
+    old_joints = {item["id"]: item for item in before.get("joints", [])}
+    new_joints = {item["id"]: item for item in after.get("joints", [])}
+    added_joints = [item for key, item in new_joints.items() if key not in old_joints]
+    removed_joints = [item for key, item in old_joints.items() if key not in new_joints]
+    updated_joints = [new_joints[key] for key in old_joints.keys() & new_joints.keys() if old_joints[key] != new_joints[key]]
+    if added_joints:
+        messages.append("新增关节 " + item_names(added_joints))
+        focus = {"kind": "joints", "id": added_joints[-1]["id"]}
+    if removed_joints:
+        messages.append("移除关节 " + item_names(removed_joints))
+    if updated_joints:
+        messages.append("更新关节 " + item_names(updated_joints))
+        focus = focus or {"kind": "joints", "id": updated_joints[-1]["id"]}
+    old_loops = {item["name"]: item for item in before.get("loops", [])}
+    new_loops = {item["name"]: item for item in after.get("loops", [])}
+    if old_loops != new_loops:
+        messages.append("更新了闭链约束")
+        added_loop = next((item for name, item in new_loops.items() if name not in old_loops), None)
+        if added_loop:
+            focus = {"kind": "loops", "id": added_loop["name"]}
+    if before.get("world_origin") != after.get("world_origin") or before.get("world_rpy") != after.get("world_rpy"):
+        messages.append("更新了整机位置和朝向")
+    if before.get("fixed_base") != after.get("fixed_base"):
+        messages.append("更新了底座")
+    if before.get("zero_pose") != after.get("zero_pose"):
+        messages.append("更新了关节零位")
+    if before.get("name") != after.get("name"):
+        messages.append("机器人名称改为 " + str(after.get("name") or ""))
+    return messages or ["工程已更新"], focus
+
+
+@app.get("/api/events")
+async def events():
+    queue: asyncio.Queue = asyncio.Queue()
+    with LISTENER_LOCK:
+        LISTENERS.append(queue)
+
+    async def stream():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+        finally:
+            with LISTENER_LOCK:
+                if queue in LISTENERS:
+                    LISTENERS.remove(queue)
+
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    })
 
 
 class ExportRequest(Model):
@@ -151,13 +249,19 @@ def get_project(job: str):
 
 
 @app.post("/api/demo/{sample}")
-def new_demo(sample: Literal["arm", "rover"]):
+def new_demo(sample: Literal["arm", "rover"], x_step_client: str | None = Header(default=None)):
     parts, project = demo(sample)
-    return create_job(parts, project, "内置示例")
+    payload = create_job(parts, project, "内置示例")
+    publish({"type": "project_opened", "job": payload["id"], "name": project.name,
+             "source": x_step_client or "", "messages": ["已打开示例 " + project.name]})
+    return payload
 
 
 @app.post("/api/import")
-def upload(files: list[UploadFile] = File(...), preferred: str = Form("")):
+def upload(files: list[UploadFile] = File(...), preferred: str = Form(""),
+           x_step_client: str | None = Header(default=None)):
+    label = Path(files[0].filename or "模型").name if files else "模型"
+    publish({"type": "import", "phase": "start", "name": label, "source": x_step_client or ""})
     try:
         with tempfile.TemporaryDirectory(prefix="step2urdf-") as directory:
             root = Path(directory)
@@ -165,27 +269,36 @@ def upload(files: list[UploadFile] = File(...), preferred: str = Form("")):
             project_file = next((file for file in assets if file.name.endswith(".cad2urdf.json")), None)
             if project_file:
                 parts, project = restore(project_file)
-                return create_job(parts, project, project_file.name)
-            candidates = [file for file in assets if file.suffix.lower() in MODEL_TYPES]
-            selected = next((file for file in candidates if file.relative_to(root).as_posix() == preferred), None)
-            if selected is None:
-                priority = {".urdf": 0, ".step": 1, ".stp": 1, ".mjcf": 2, ".xml": 2,
-                            ".usd": 3, ".usda": 3, ".usdc": 3}
-                selected = min(candidates, key=lambda file: (priority[file.suffix.lower()], len(file.parts), file.name),
-                               default=None)
-            if selected is None:
-                raise ValueError("未找到 STEP、URDF、MJCF、USD 或 Step2URDF 工程文件。")
-            parts, project = import_model(selected, assets)
-            return create_job(parts, project, selected.name)
+                payload = create_job(parts, project, project_file.name)
+            else:
+                candidates = [file for file in assets if file.suffix.lower() in MODEL_TYPES]
+                selected = next((file for file in candidates if file.relative_to(root).as_posix() == preferred), None)
+                if selected is None:
+                    priority = {".urdf": 0, ".step": 1, ".stp": 1, ".mjcf": 2, ".xml": 2,
+                                ".usd": 3, ".usda": 3, ".usdc": 3}
+                    selected = min(candidates, key=lambda file: (priority[file.suffix.lower()], len(file.parts), file.name),
+                                   default=None)
+                if selected is None:
+                    raise ValueError("未找到 STEP、URDF、MJCF、USD 或 Step2URDF 工程文件。")
+                parts, project = import_model(selected, assets)
+                payload = create_job(parts, project, selected.name)
     except (ValueError, RuntimeError, BadZipFile, KeyError, IndexError, TypeError, OSError, SyntaxError, ValidationError) as error:
+        publish({"type": "import", "phase": "error", "name": label, "message": str(error), "source": x_step_client or ""})
         raise HTTPException(422, str(error)) from error
+    publish({"type": "import", "phase": "done", "job": payload["id"], "name": payload["source"],
+             "source": x_step_client or ""})
+    return payload
 
 
 @app.put("/api/projects/{job}")
-def save_project(job: str, project: Project):
+def save_project(job: str, project: Project, x_step_client: str | None = Header(default=None)):
     payload = read_job(job)
-    payload["project"] = project.model_dump()
+    before = payload["project"]
+    after = project.model_dump(mode="json")
+    payload["project"] = after
     persist(job, payload)
+    messages, focus = describe_project_change(before, after)
+    publish({"type": "project", "job": job, "source": x_step_client or "", "messages": messages, "focus": focus})
     return {"saved": True}
 
 
@@ -243,6 +356,28 @@ def export(job: str, request: ExportRequest):
         suffix += "-simplified"
     return Response(result, media_type="application/zip",
                     headers={"Content-Disposition": f'attachment; filename="{name}{suffix}.zip"'})
+
+
+def skill_directory():
+    packaged = ROOT / "skill" / "step2urdf-upload"
+    if (packaged / "SKILL.md").is_file():
+        return packaged
+    checkout = ROOT / ".cursor" / "skills" / "step2urdf-upload"
+    if (checkout / "SKILL.md").is_file():
+        return checkout
+    raise HTTPException(404, "上传技能包不存在。")
+
+
+@app.get("/skill/step2urdf-upload.zip")
+def download_skill():
+    directory = skill_directory()
+    buffer = BytesIO()
+    with ZipFile(buffer, "w") as archive:
+        for path in directory.rglob("*"):
+            if path.is_file() and "__pycache__" not in path.parts:
+                archive.write(path, Path("step2urdf-upload") / path.relative_to(directory))
+    return Response(buffer.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": 'attachment; filename="step2urdf-upload.zip"'})
 
 
 if (ROOT / "dist").is_dir():

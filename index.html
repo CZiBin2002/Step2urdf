@@ -6,6 +6,7 @@
   <meta name="description" content="本地 CAD2URDF 工作台，编辑机器人 Link 与关节，导出模型和强化学习工程。">
   <meta name="theme-color" content="#111820">
   <title>Step2URDF · CAD 工作台</title>
+  <link rel="stylesheet" href="/frontend/style.css">
 </head>
 <body>
   <header class="header">
@@ -15,6 +16,7 @@
     <div class="top-actions">
       <button id="undo" class="icon-button" title="撤销 (Ctrl+Z)" aria-label="撤销"><i data-lucide="undo-2"></i></button>
       <button id="redo" class="icon-button" title="重做 (Ctrl+Y)" aria-label="重做"><i data-lucide="redo-2"></i></button>
+      <button id="mcpAccess" class="button secondary"><i data-lucide="plug"></i><span>MCP 接入</span></button>
       <button id="saveProject" class="button secondary"><i data-lucide="save"></i><span>保存工程</span></button>
       <button id="openExport" class="button primary"><i data-lucide="download"></i><span>导出</span></button>
     </div>
@@ -54,6 +56,13 @@
   <footer class="footer"><span><span class="status-dot"></span> 本地工作区</span><span class="footer-meta" id="counts">—</span><span class="footer-right">Z-UP <b>·</b> 米 / 弧度 <b>·</b> <span id="sourceLabel">等待模型</span></span></footer>
   <dialog id="dialog" aria-labelledby="dialogTitle"></dialog>
   <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="busy" class="busy">
+    <div class="busy-card" role="status" aria-live="polite">
+      <span class="spinner" aria-hidden="true"></span>
+      <strong id="busyTitle">正在处理</strong>
+      <p id="busyDetail"></p>
+    </div>
+  </dialog>
   <input id="modelInput" type="file" multiple accept=".step,.stp,.urdf,.xml,.mjcf,.usd,.usda,.usdc,.zip,.json" hidden>
   <input id="folderInput" type="file" webkitdirectory multiple hidden>
   <script type="module" src="/frontend/main.js"></script>

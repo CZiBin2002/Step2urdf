@@ -1,26 +1,33 @@
 import {
   ArrowDownToLine, ArrowRight, Box, Check, ChevronDown, CircleHelp, CloudUpload,
   Download, Eye, EyeOff, FileCode, Folder, FolderOpen, GitBranch, Layers3, Link2,
-  Maximize, Mouse, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
+  Maximize, Mouse, Plug, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
   Sparkles, Trash2, Undo2, X, createIcons,
 } from 'lucide';
 
-import './style.css';
-import { Viewer, jointCoordinate } from './viewer.js';
+import { Viewer, composeWorldPose, jointCoordinate, resetWorldRotation } from './viewer.js';
 
 const $ = selector => document.querySelector(selector);
 const icon = name => '<i data-lucide="' + name + '"></i>';
 const icons = {
   ArrowDownToLine, ArrowRight, Box, Check, ChevronDown, CircleHelp, CloudUpload,
   Download, Eye, EyeOff, FileCode, Folder, FolderOpen, GitBranch, Layers3, Link2,
-  Maximize, Mouse, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
+  Maximize, Mouse, Plug, Plus, Redo2, RotateCcw, Save, ScanLine, Search, SlidersHorizontal,
   Sparkles, Trash2, Undo2, X,
 };
 const paintIcons = () => createIcons({ icons, attrs: { 'stroke-width': 1.65 } });
 const esc = value => String(value ?? '').replace(/[&<>"']/g, character =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 const clone = value => structuredClone(value);
-const id = () => crypto.randomUUID().slice(0, 12);
+function randomUUID() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map(value => value.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+}
+const id = () => randomUUID().slice(0, 12);
 const zero = [0, 0, 0];
 const unitZ = [0, 0, 1];
 const kindLabel = { fixed: '固定', revolute: '旋转', continuous: '连续旋转', prismatic: '滑动', ball: '球铰' };
@@ -54,6 +61,10 @@ let saveRequest = Promise.resolve();
 let exportOptions = { formats: ['urdf'], merge: false, simplify_urdf: false, training: 'isaac' };
 
 const dialog = $('#dialog');
+const clientId = randomUUID();
+const localJobs = new Set();
+let remoteChain = Promise.resolve();
+let remoteActive = false;
 let viewer;
 try {
   viewer = new Viewer($('#canvasHost'), selectPart);
@@ -62,7 +73,8 @@ try {
 }
 
 async function api(path, method = 'GET', body) {
-  const headers = body && !(body instanceof FormData) ? { 'Content-Type': 'application/json' } : {};
+  const headers = { 'X-Step-Client': clientId };
+  if (body && !(body instanceof FormData)) headers['Content-Type'] = 'application/json';
   const response = await fetch('/api' + path, {
     method,
     headers,
@@ -81,6 +93,19 @@ async function api(path, method = 'GET', body) {
 const projectApi = (operation, data = project, method = 'POST') => api(
   '/projects/' + job.id + (operation ? '/' + operation : ''), method, data,
 );
+
+const paintFrame = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+
+function setBusy(title, detail = '') {
+  const overlay = $('#busy');
+  if (!title) {
+    if (overlay.open) overlay.close();
+    return;
+  }
+  $('#busyTitle').textContent = title;
+  $('#busyDetail').textContent = detail;
+  if (!overlay.open) overlay.showModal();
+}
 
 function toast(text, error = false) {
   const target = $('#toast');
@@ -135,6 +160,7 @@ function history(undoing) {
 }
 
 function load(data) {
+  localJobs.add(data.id);
   job = data;
   project = data.project;
   project.zero_pose ??= {};
@@ -361,10 +387,45 @@ function renderInspector() {
       renderLoop(target, selected);
     }
   }
-  target.insertAdjacentHTML('beforeend', '<button class="button quiet wide model-settings" id="modelSettings">' +
+  target.insertAdjacentHTML('beforeend', orientationPanel() +
+    '<button class="button quiet wide model-settings" id="modelSettings">' +
     icon('sliders-horizontal') + '模型基准与初始位姿</button>');
+  target.querySelectorAll('[data-turn]').forEach(button => button.onclick = () => turnModel(button.dataset.turn));
   $('#modelSettings').onclick = openSettings;
   paintIcons();
+}
+
+function assemblyCenter() {
+  const items = Object.values(parts).filter(part => part.bounds);
+  if (!items.length) return [...zero];
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (const part of items) {
+    part.bounds[0].forEach((value, index) => { min[index] = Math.min(min[index], value); });
+    part.bounds[1].forEach((value, index) => { max[index] = Math.max(max[index], value); });
+  }
+  return min.map((value, index) => (value + max[index]) / 2);
+}
+
+function orientationPanel() {
+  const buttons = ['X', 'Y', 'Z'].flatMap((axis, index) => [1, -1].map(sign =>
+    '<button type="button" class="button quiet" data-turn="' + index + ':' + sign + '">绕 ' + axis +
+    (sign > 0 ? ' +' : ' −') + '90°</button>')).join('') +
+    '<button type="button" class="button quiet" data-turn="reset">朝向归零</button>';
+  return '<section class="orientation"><h4>整机朝向</h4><p>STEP 躺倒或立起来时，绕 X 或 Y 转 90° 放到正确姿态。绕模型中心旋转，可撤销。</p>' +
+    '<div class="orientation-actions">' + buttons + '</div></section>';
+}
+
+function turnModel(turn) {
+  if (turn === 'reset' && project.world_rpy.every(value => Math.abs(value) < 1e-8)) return;
+  const center = assemblyCenter();
+  const next = turn === 'reset'
+    ? resetWorldRotation(project.world_origin, project.world_rpy, center)
+    : composeWorldPose(project.world_origin, project.world_rpy, center, ...turn.split(':').map(Number));
+  edit(() => {
+    project.world_origin = next.world_origin;
+    project.world_rpy = next.world_rpy;
+  });
 }
 
 function bindFields(target, item, shouldChange = () => true) {
@@ -797,6 +858,7 @@ function openMass(link, physical) {
 
 function openSettings() {
   formDialog('模型基准与初始位姿', field('机器人名称', 'name', project.name) +
+    '<p class="subtle">模型躺倒时，用检查器底部的整机朝向绕 X 或 Y 转 90°。这里的旋转是弧度，固定底座时会写入 URDF、MJCF 和 USD。</p>' +
     vectors('平移 (m)', 'world_origin', project.world_origin) + vectors('旋转 RPY (rad)', 'world_rpy', project.world_rpy) +
     select('仿真底座', 'fixed_base', project.fixed_base ? 'fixed' : 'floating', [['fixed', '固定'], ['floating', '自由']]),
   '应用', values => {
@@ -885,22 +947,27 @@ async function droppedFiles(items, fallback) {
 async function loadDemo(name) {
   if (loading) return;
   loading = true;
+  setBusy('正在载入示例…', '请稍候。');
+  await paintFrame();
   try {
     load(await (await api('/demo/' + name, 'POST')).json());
     latestFiles = [];
     preferredModel = '';
   } catch (error) { toast(error.message, true); }
-  finally { loading = false; }
+  finally { loading = false; setBusy(null); }
 }
 
 async function importFiles(files) {
   if (!files.length || loading) return;
-  if (!dialog.open) await openImport();
   loading = true;
-  const status = $('#importMessage');
-  const body = new FormData();
   const newFiles = files.map(entry => ({ file: entry.file ?? entry, path: entry.path ?? (entry.webkitRelativePath || entry.name) }));
   const main = newFiles.find(item => /\.(urdf|stp|step|usd[ac]?|mjcf|xml)$/i.test(item.path));
+  const label = (main?.path ?? newFiles[0].path).split(/[/\\]/).pop();
+  setBusy('正在导入 ' + label, '正在上传并解析几何与装配。大 STEP 可能需要几分钟，请不要关闭页面。');
+  await paintFrame();
+  if (!dialog.open) await openImport();
+  const status = $('#importMessage');
+  const body = new FormData();
   const augment = latestFiles.length && newFiles.some(item => item.path.includes('/')) &&
     (!main || !newFiles.some(item => /\.(step|stp|urdf|usd[ac]?|mjcf)$/i.test(item.path)));
   const merged = new Map((augment ? latestFiles : []).map(item => [item.path.toLowerCase(), item]));
@@ -909,18 +976,23 @@ async function importFiles(files) {
   if (!augment) preferredModel = newFiles.length === 1 ? (main?.path ?? '') : '';
   latestFiles.forEach(item => body.append('files', item.file, item.path));
   body.set('preferred', preferredModel);
-  status.hidden = false;
-  status.classList.remove('form-error');
-  status.textContent = '正在解析几何与装配结构…';
+  if (status) {
+    status.hidden = false;
+    status.classList.remove('form-error');
+    status.textContent = '正在解析几何与装配结构…';
+  }
   try {
     load(await (await api('/import', 'POST', body)).json());
     latestFiles = [];
     preferredModel = '';
     toast('模型已导入。');
   } catch (error) {
-    status.classList.add('form-error');
-    status.textContent = error.message;
-  } finally { loading = false; }
+    if (status) {
+      status.classList.add('form-error');
+      status.textContent = error.message;
+    }
+    toast(error.message, true);
+  } finally { loading = false; setBusy(null); }
 }
 
 function openExport() {
@@ -1014,6 +1086,51 @@ for (const button of document.querySelectorAll('[data-inspect]')) button.onclick
 $('#search').oninput = () => { if (project) renderTree(); };
 $('#importButton').onclick = openImport;
 $('#openExport').onclick = openExport;
+function mcpInstructions() {
+  const endpoint = location.protocol + '//' + location.hostname + ':18766/mcp';
+  const upload = location.protocol + '//' + location.host + '/api/import';
+  const skill = location.origin + '/skill/step2urdf-upload.zip';
+  return '请在当前客户端接入这个 MCP 服务，不要设置 Token。\n\n' +
+    '名称：step2urdf\n传输：Streamable HTTP\n地址：' + endpoint + '\n\n' +
+    '配置：\n{\n  "mcpServers": {\n    "step2urdf": {\n      "type": "http",\n      "url": "' + endpoint + '"\n    }\n  }\n}\n\n' +
+    '同时下载上传技能，解压到当前 AI 客户端的 skills 目录：\n' + skill + '\n' +
+    '解压后的文件夹名保持 step2urdf-upload。这是通用 Agent Skill，不限定某一种编辑器。' +
+    '本地 STP 由这个技能上传到 ' + upload + '，字段名 files。';
+}
+
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* 局域网 HTTP 页面通常不允许剪贴板接口。 */ }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.left = '-9999px';
+  document.body.append(area);
+  area.select();
+  const copied = document.execCommand('copy');
+  area.remove();
+  return copied;
+}
+
+function openMcpAccess() {
+  const text = mcpInstructions();
+  const skill = location.origin + '/skill/step2urdf-upload.zip';
+  modal('MCP 接入', '<div class="dialog-body"><p class="subtle">把下面的内容复制给 AI，配置 MCP。上传技能是通用 Agent Skill，解压到所用客户端的 skills 目录，文件夹名保持 step2urdf-upload。</p>' +
+    '<textarea id="mcpText" class="mcp-copy" readonly>' + esc(text) + '</textarea>' +
+    '<div class="dialog-actions"><a class="button secondary" href="' + esc(skill) + '" download>下载上传技能</a>' +
+    '<button id="copyMcp" type="button" class="button primary">复制给 AI</button></div></div>');
+  $('#copyMcp').onclick = async () => {
+    const copied = await copyText($('#mcpText').value);
+    toast(copied ? '已复制，粘贴给 AI 即可。' : '复制失败，请在文本框里手动选择复制。', !copied);
+  };
+}
+
+$('#mcpAccess').onclick = openMcpAccess;
 $('#saveProject').onclick = saveProject;
 $('#undo').onclick = () => history(true);
 $('#redo').onclick = () => history(false);
@@ -1027,7 +1144,7 @@ $('#showCollisions').onclick = event => {
   syncView();
 };
 $('#help').onclick = () => modal('工作台帮助', '<div class="dialog-body help-body"><ol>' +
-  '<li>导入 STEP 或已有机器人模型。缺少资源时补选模型文件夹。</li>' +
+  '<li>导入 STEP 或已有机器人模型。缺少资源时补选模型文件夹。模型躺倒时，用检查器底部的整机朝向转 90°。</li>' +
   '<li>在零件列表或 3D 中选择零件，创建 Link。按 Shift 或 Ctrl 多选。</li>' +
   '<li>创建关节，检查父子关系、转轴和限位。若机构有闭环，添加单独的闭链约束。</li>' +
   '<li>在试转页检查运动，在测试与导出中生成模型或训练工程。</li></ol></div>');
@@ -1041,13 +1158,103 @@ document.addEventListener('keydown', event => {
   const key = event.key.toLowerCase();
   if (key === 'z' || key === 'y') { event.preventDefault(); history(key === 'z' && !event.shiftKey); }
 });
+function sameMeshes(nextParts) {
+  const current = Object.keys(parts);
+  const incoming = Object.keys(nextParts);
+  return current.length === incoming.length && incoming.every(key => parts[key]);
+}
+
+function showRemoteProject(data, event) {
+  const focus = event.focus;
+  if (job?.id === data.id && sameMeshes(data.parts)) {
+    job = data;
+    project = data.project;
+    project.zero_pose ??= {};
+    parts = data.parts;
+    undo = [];
+    redo = [];
+    pose = {};
+    massProperties = {};
+    aiResult = null;
+    axisOptions = [];
+    if (focus?.id) {
+      selection = { kind: focus.kind, id: focus.id };
+      treeTab = focus.kind === 'parts' ? treeTab : focus.kind;
+      inspector = 'properties';
+    }
+    step = 'configure';
+    if (dialog.open) dialog.close();
+    render();
+  } else {
+    load(data);
+    if (focus?.id) {
+      selection = { kind: focus.kind, id: focus.id };
+      treeTab = focus.kind;
+      render();
+    }
+  }
+  if (event.messages?.length) toast(event.messages.join('；'));
+}
+
+async function applyRemote(event) {
+  if (event.source === clientId) return;
+  if (event.type === 'import' && event.phase === 'start') {
+    if (loading) return;
+    loading = true;
+    remoteActive = true;
+    setBusy('正在导入 ' + event.name, '接口正在上传并解析几何与装配。大 STEP 可能需要几分钟，请不要关闭页面。');
+    return;
+  }
+  if (event.type === 'import' && event.phase === 'error') {
+    if (!remoteActive) return;
+    loading = false;
+    remoteActive = false;
+    setBusy(null);
+    toast(event.message, true);
+    return;
+  }
+  if (event.type === 'import' && event.phase === 'done') {
+    if (loading && !remoteActive) return;
+    if (localJobs.has(event.job)) {
+      if (remoteActive) { loading = false; remoteActive = false; setBusy(null); }
+      return;
+    }
+    try {
+      showRemoteProject(await (await api('/projects/' + event.job)).json(),
+        { messages: ['已导入 ' + event.name] });
+    } finally {
+      if (remoteActive) { loading = false; remoteActive = false; setBusy(null); }
+    }
+    return;
+  }
+  if ((event.type === 'project' || event.type === 'project_opened') && !loading) {
+    showRemoteProject(await (await api('/projects/' + event.job)).json(), event);
+  }
+}
+
+function watchRemote() {
+  const source = new EventSource('/api/events');
+  source.onmessage = message => {
+    const event = JSON.parse(message.data);
+    remoteChain = remoteChain.then(() => applyRemote(event)).catch(error => toast(error.message, true));
+  };
+}
+
 paintIcons();
+$('#busy').addEventListener('cancel', event => event.preventDefault());
+watchRemote();
 const previous = localStorage.getItem('step2urdf.last');
 try {
   if (!previous) await loadDemo('arm');
-  else load(await (await api('/projects/' + previous)).json());
+  else {
+    setBusy('正在载入上次的模型…', '正在读取缓存并生成网格，大模型会停留在这一步。');
+    await paintFrame();
+    load(await (await api('/projects/' + previous)).json());
+  }
 } catch {
   await loadDemo('arm');
+} finally {
+  setBusy(null);
 }
 if (!job) {
   $('#viewMessage').textContent = '无法连接转换服务。请启动本地服务后重新加载。';

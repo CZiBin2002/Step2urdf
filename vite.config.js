@@ -2,6 +2,8 @@ import { defineConfig } from 'vite';
 
 export default defineConfig({
   server: {
-    proxy: { '/api': 'http://127.0.0.1:8765' },
+    proxy: {
+      '/api': { target: 'http://127.0.0.1:18765', timeout: 0, proxyTimeout: 0 },
+    },
   },
 });

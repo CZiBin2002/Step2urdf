@@ -1,0 +1,36 @@
+services:
+  workbench:
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
+    image: step2urdf/workbench:latest
+    user: "1000:1000"
+    ports:
+      - "18765:18765"
+    environment:
+      STEP2URDF_PROJECTS: /data/projects
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  mcp:
+    build:
+      context: ./mcp
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    image: step2urdf/mcp:latest
+    user: "1000:1000"
+    depends_on:
+      workbench:
+        condition: service_healthy
+    ports:
+      - "18766:18766"
+    environment:
+      WORKBENCH_URL: http://workbench:18765
+      DATA_DIR: /data
+      MCP_TOKEN: ${MCP_TOKEN:-}
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
